@@ -18,6 +18,7 @@ from kernel_agent_v1.clock import SimClock
 from kernel_agent_v1.coder import Coder
 from kernel_agent_v1.dual_research import DualResearch
 from kernel_agent_v1.evaluator import TrustedEvaluator
+from kernel_agent_v1.gdn_campaign import GDN_ROOT_ROUTE, GDN_SUBROUTES
 from kernel_agent_v1.gdn_gpu_runner import _run_benchmark_block
 from kernel_agent_v1.gdn_task import (
     load_official_definition,
@@ -181,49 +182,141 @@ class TestGdnAdaptation(unittest.TestCase):
                 [t["timeout_s"] for t in tasks if t["kind"] == "abba_retest"], [18_000.0]
             )
 
-    def test_version_cap_finishes_v100_then_evaluates_only_incumbent(self) -> None:
+    def test_version_cap_and_route_stagnation_independently_end_campaign(self) -> None:
+        for cap, expected_versions, stop_reason in (
+            (3, 3, "completed"),
+            (500, 1 + 3 * (len(GDN_SUBROUTES) + 1), "routes_exhausted"),
+        ):
+            with self.subTest(cap=cap), tempfile.TemporaryDirectory() as tmp:
+                backend = TimedBackend(TrustedEvaluator.from_official_gdn_dataset())
+                backend.set_behavior("benchmark_block", {"duration_s": 1.0, "speedup": 1.2})
+                proposals = 0
+                discovery_calls = 0
+
+                def reply(messages):
+                    nonlocal proposals, discovery_calls
+                    request = json.loads(messages[-1].content)
+                    if "routes" in request:
+                        discovery_calls += 1
+                        parent = next(iter(GDN_SUBROUTES))
+                        receipt = next(key for key, row in request["evidence"].items()
+                                       if row["direction_id"] == parent)
+                        # Later discovery calls repeat the same idea and must be rejected.
+                        return {
+                            "parent_direction_id": parent, "receipt_id": receipt,
+                            "hypothesis": "Split the short and long shape dispatch.",
+                            "mechanism": "Dispatch by maximum segment length.",
+                            "falsification_test": "Check full-workload latency and correctness.",
+                        }
+                    if "head" not in request:
+                        self.assertIn(request["direction_id"], (*GDN_SUBROUTES, "gdn-discovered-0001"))
+                        return {"instruction": "Try another tile option."}
+                    proposals += 1
+                    return {
+                        "artifact_id": "same-model-label", "entrypoint": "kernel.py",
+                        "files": {"kernel.py": seed_gdn_candidate_source() + f"\n# candidate {proposals}\n"},
+                    }
+
+                with patch("kernel_agent_v1.cli.SimulatedExecutionBackend", return_value=backend), \
+                     patch("kernel_agent_v1.cli.DeepSeekClient",
+                           return_value=ScriptedDeepSeekClient(reply)), redirect_stdout(StringIO()):
+                    rc = cli_main(["run", "--deepseek-live", "--max-versions", str(cap), "--run-dir", tmp])
+
+                self.assertEqual(rc, 0)
+                self.assertEqual(proposals, expected_versions - 1)
+                config = json.loads((Path(tmp) / "run_config.json").read_text())["runtime_config"]
+                result = json.loads((Path(tmp) / "run_result.json").read_text())
+                self.assertEqual(config["stagnation_limit"], 3)
+                self.assertEqual(result["last_admitted_version"], expected_versions)
+                self.assertEqual(result["versions_closed"], expected_versions)
+                self.assertEqual(result["version_cap_reached"], cap == expected_versions)
+                self.assertEqual(result["stop_reason"], stop_reason)
+                self.assertTrue(result["last_admitted_version_closed"])
+                self.assertEqual(result["final_eval_version_id"], "V1")
+                self.assertTrue(result["final_eval_completed"])
+
+                store = RunStore(tmp)
+                routes = json.loads((Path(tmp) / "run_routes.json").read_text())["routes"]
+                self.assertEqual(discovery_calls, 4 if cap == 500 else 0)
+                if cap == 500:
+                    self.assertEqual(routes["gdn-discovered-0001"]["parent_direction_id"], next(iter(GDN_SUBROUTES)))
+                    self.assertEqual(routes["gdn-discovered-0001"]["stagnation_count"], 3)
+                for route in GDN_SUBROUTES:
+                    self.assertEqual(routes[route]["parent_direction_id"], GDN_ROOT_ROUTE)
+                    if cap == 500:
+                        self.assertEqual(routes[route]["stagnation_count"], 3)
+                        self.assertEqual(routes[route]["status"], "paused")
+                lifecycle = [json.loads(row) for row in (Path(tmp) / "lifecycle.jsonl").read_text().splitlines()]
+                final_schedules = [row for row in lifecycle if row["event"] == "final_eval_scheduled"]
+                self.assertEqual(len(final_schedules), 1)
+                self.assertEqual(final_schedules[0]["last_admitted_version"], expected_versions)
+                events = [event for _, event in store.load_events()]
+                terminal_close = next(i for i, event in enumerate(events) if (
+                    event.event == EventType.VERSION_CLOSED.value
+                    and event.version_id == f"V{expected_versions}"
+                ))
+                final_jobs = [(i, event) for i, event in enumerate(events) if event.kind == "final_eval"]
+                self.assertEqual([event.block_id for _, event in final_jobs], ["F1", "F2", "F3"])
+                self.assertTrue(all(i > terminal_close and event.version_id == "V1" for i, event in final_jobs))
+
+    def test_version_campaign_repairs_then_switches_with_verified_source(self) -> None:
+        first_route, next_route = list(GDN_SUBROUTES)[:2]
+
+        class RoutedBackend(TimedBackend):
+            def _lookup_behavior(self, task_id, attempt_id, artifact_id, kind, block_id, inputs):
+                version = inputs["version_id"]
+                if version == "V2" and kind == "benchmark_block" and block_id == "W2":
+                    return {"duration_s": 1.0, "compile_fail": True}
+                if version == "V3" and kind == "benchmark_block" and block_id == "W2":
+                    return {"duration_s": 1.0, "numerical_fail": True}
+                if version == "V4":
+                    return {
+                        "duration_s": 1.0, "speedup": 2.0,
+                        "incorrect_uuids": [self.evaluator.uuids[0]] if kind == "abba_retest" else [],
+                    }
+                return {"duration_s": 1.0, "speedup": 1.2}
+
         with tempfile.TemporaryDirectory() as tmp:
-            evaluator = TrustedEvaluator.from_official_gdn_dataset()
-            backend = TimedBackend(evaluator)
-            backend.set_behavior("benchmark_block", {"duration_s": 1.0, "speedup": 1.2})
-            source = seed_gdn_candidate_source()
-            proposals = 0
+            backend = RoutedBackend(TrustedEvaluator.from_official_gdn_dataset())
+            seed = seed_gdn_candidate_source()
+            coder_requests = []
 
             def reply(messages):
-                nonlocal proposals
                 request = json.loads(messages[-1].content)
                 if "head" not in request:
-                    return {"allowed_paths": ["kernel.py"], "preserve_target": False}
-                proposals += 1
+                    return {"instruction": "Change the kernel within this route."}
+                coder_requests.append(request)
+                proposal = len(coder_requests)
                 return {
-                    "artifact_id": f"candidate-{proposals}", "entrypoint": "kernel.py",
-                    "files": {"kernel.py": source + f"\n# candidate {proposals}\n"},
+                    "artifact_id": "same-label", "entrypoint": "kernel.py",
+                    "files": {"kernel.py": seed if proposal == 1 else seed + f"\n# candidate {proposal}\n"},
                 }
 
             with patch("kernel_agent_v1.cli.SimulatedExecutionBackend", return_value=backend), \
                  patch("kernel_agent_v1.cli.DeepSeekClient",
                        return_value=ScriptedDeepSeekClient(reply)), redirect_stdout(StringIO()):
-                rc = cli_main(["run", "--deepseek-live", "--max-versions", "100", "--run-dir", tmp])
+                self.assertEqual(cli_main([
+                    "run", "--deepseek-live", "--max-versions", "5", "--run-dir", tmp,
+                ]), 0)
 
-            self.assertEqual(rc, 0)
-            self.assertEqual(proposals, 99)
-            result = json.loads((Path(tmp) / "run_result.json").read_text())
-            self.assertEqual(result["last_admitted_version"], 100)
-            self.assertTrue(result["last_admitted_version_closed"])
-            self.assertEqual(result["versions_closed"], 100)
-            self.assertEqual(result["final_eval_version_id"], "V1")
-            self.assertTrue(result["final_eval_completed"])
-            lifecycle = [json.loads(row) for row in (Path(tmp) / "lifecycle.jsonl").read_text().splitlines()]
-            final_schedules = [row for row in lifecycle if row["event"] == "final_eval_scheduled"]
-            self.assertEqual(len(final_schedules), 1)
-            self.assertEqual(final_schedules[0]["last_admitted_version"], 100)
-            events = [event for _, event in RunStore(tmp).load_events()]
-            terminal_close = next(i for i, event in enumerate(events)
-                                  if event.event == EventType.VERSION_CLOSED.value and event.version_id == "V100")
-            final_jobs = [(i, event) for i, event in enumerate(events) if event.kind == "final_eval"]
-            self.assertEqual([event.block_id for i, event in final_jobs], ["F1", "F2", "F3"])
-            self.assertTrue(all(i > terminal_close and event.version_id == "V1" for i, event in final_jobs))
-            self.assertTrue((Path(tmp) / "evidence" / "llm-00198-response.json").exists())
+            def target_version(request):
+                return request["head"]["target"]["version_id"]
+
+            self.assertEqual([target_version(r) for r in coder_requests], ["V1", "V1", "V2", "V3", "V1"])
+            self.assertEqual([r["head"]["direction_id"] for r in coder_requests], [first_route] * 4 + [next_route])
+            self.assertEqual(["repair_context" in r for r in coder_requests], [False, False, True, True, False])
+            self.assertEqual(coder_requests[-1]["parent_files"]["kernel.py"], seed)
+            store = RunStore(tmp)
+            self.assertEqual(store.read_evidence("duplicate-cmd-002")["direction_id"], first_route)
+            state = store.load_snapshot()
+            self.assertEqual(state["paused_routes"], [first_route])
+            self.assertEqual(state["closed_versions"]["V5"]["direction_id"], next_route)
+            routes = json.loads((Path(tmp) / "run_routes.json").read_text())["routes"]
+            self.assertEqual(routes[first_route]["repair_count"], 2)
+            self.assertEqual(routes[first_route]["compile_failure_count"], 1)
+            self.assertEqual(routes[first_route]["correctness_failure_count"], 2)
+            self.assertEqual(routes[first_route]["stagnation_count"], 0)
+            self.assertEqual(routes[first_route]["pause_reason"], "repair_limit_reached")
 
     def test_dual_researcher_uses_diagnosis_available_before_command(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

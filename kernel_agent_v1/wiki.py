@@ -302,6 +302,7 @@ class RouteNode:
     stagnation_count: int = 0
     compile_failure_count: int = 0
     correctness_failure_count: int = 0
+    execution_failure_count: int = 0
     repair_count: int = 0
     pause_reason: str | None = None
     reusable_evidence: list[dict[str, Any]] = field(default_factory=list)
@@ -325,6 +326,7 @@ class RouteNode:
             "stagnation_count": self.stagnation_count,
             "compile_failure_count": self.compile_failure_count,
             "correctness_failure_count": self.correctness_failure_count,
+            "execution_failure_count": self.execution_failure_count,
             "repair_count": self.repair_count,
             "pause_reason": self.pause_reason,
             "reusable_evidence": list(self.reusable_evidence),
@@ -452,13 +454,13 @@ class ExperimentRouteTree:
     def record_failure_repair(
         self,
         direction_id: str,
-        failure_kind: str,  # "compile_failure" | "correctness_failure"
+        failure_kind: str,
         version_id: str | None,
         artifact_id: str,
         receipt_id: str | None = None,
         is_repair: bool = False,
     ) -> None:
-        """Compile & correctness failures go to separate counters, not stagnation."""
+        """Record candidate failures outside the performance stagnation counter."""
         if direction_id not in self.routes:
             return
         node = self.routes[direction_id]
@@ -466,10 +468,13 @@ class ExperimentRouteTree:
             node.compile_failure_count += 1
         elif failure_kind == "correctness_failure":
             node.correctness_failure_count += 1
+        elif failure_kind == "execution_failure":
+            node.execution_failure_count += 1
         if is_repair:
             node.repair_count += 1
         for exp in node.experiments:
             if exp.artifact_id == artifact_id:
+                exp.version_id = version_id
                 exp.final_verdict = failure_kind
                 if receipt_id:
                     exp.trusted_results["failure_receipt_id"] = receipt_id

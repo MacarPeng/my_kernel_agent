@@ -491,3 +491,4 @@ class RuntimeConfig:
     require_abba_on_first_candidate: bool = False
     snapshot_interval: int = 10
     budgets: BudgetConfig = field(default_factory=BudgetConfig)
+    finalize_when_admission_frozen: bool = False

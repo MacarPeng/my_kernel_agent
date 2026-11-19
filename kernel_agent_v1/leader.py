@@ -194,7 +194,7 @@ class Leader:
             return []
 
         events: list[Event] = []
-        if verdict in ("promoted", "rejected_no_gain", "rejected_abba"):
+        if verdict in ("promoted", "rejected_no_gain", "rejected_abba") and p.get("all_correct", True):
             # Only complete comparable verdicts count as a route round (§3);
             # ExperimentRouteTree deduplicates by artifact_id so ABBA won't double-count.
             if delivery.result_kind in ("judge_benchmark_complete", "judge_abba_retest"):

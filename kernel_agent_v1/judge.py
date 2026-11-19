@@ -331,6 +331,7 @@ class Judge:
                 "needs_retest": False,
                 "geomean_speedup": cand_score,
                 "abba_gain": abba.geomean_gain,
+                "all_correct": abba.all_correct,
                 "issues": issues,
             },
         )

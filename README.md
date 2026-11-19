@@ -68,8 +68,12 @@ python3 -m kernel_agent_v1.cli run --backend real-gpu --gpu NVIDIA-L4 --run-dir 
 实卡运行时，普通任务默认超时为 1800 秒，单次诊断上限为 450 秒，并受诊断有效期约束。`--abba-retest-timeout-s` 默认 18000 秒，`--final-eval-timeout-s` 默认每个终评块 36000 秒。默认整轮墙钟和 GPU 调度预算会计入 ABBA 和三块终评的预留时间。手动指定的超时和整轮预算均按传入的秒数生效。
 
 
-### V100 长实验
+### V500 长实验
 
-用 `--max-versions 100` 取代 `--max-rounds`。种子计作 V1，V100 完成对应的评测和判定后停止迭代，只对保留下来的最优版本发起一次终评。F1、F2、F3 是该次终评内部的三次测量。如果预算耗尽或候选生成中断，未到目标的运行会以非零状态退出，并在 `run_result.json` 中写明进度和原因。
+使用 `--deepseek-live --max-versions 500` 运行路线搜索，种子计作 V1。状态切分、短序列路径、分块递推、变长任务分配、状态布局和门控融合分别注册为子路线。三次完整评测无明显进步会暂停对应路线。候选编译、执行或数值失败时，同一失败链最多提交两份修复源码，修复耗尽后切换到下一条可运行路线。相同源码只接纳一次。
 
-`run_config.json` 记录启动配置，`lifecycle.jsonl` 记录版本接纳、GPU 任务启动及终评排程，`events.jsonl` 和 `scheduler_decisions.jsonl` 记录事件和调度决定，`evidence/` 和 `packages/` 保存评测证据、判定、模型调用和候选源码。`pipeline_timeline.html` 汇总工作时间。指定版本数时自动开启模型调用日志，不记录 HTTP 鉴权头。
+所有已知子路线暂停后，Design Researcher 必须根据现有实验回执提出新的支路。新支路须指定父路线、对应的回执、不同的优化机制和可证伪的测试。新支路继承同样的停止规则，并记录在 `run_routes.json` 和 `lifecycle.jsonl` 中。运行时校验父路线与回执的归属，按标准化文本拦截重复假设和机制。
+
+达到版本上限、预算接近耗尽，或三次开支路请求都未得到合格提案时，搜索结束，并对保留下来的最优版本发起一次终评。F1、F2、F3 是该次终评内部的三次测量。`run_result.json` 记录实际完成的版本数、是否达到上限和停止原因。
+
+`run_config.json` 记录启动配置。`run_routes.json` 记录父子路线、停滞计数、修复计数和暂停原因。`lifecycle.jsonl` 记录版本接纳、GPU 任务启动及终评排程。`events.jsonl` 和 `scheduler_decisions.jsonl` 记录事件和调度决定。`evidence/` 和 `packages/` 保存评测证据、判定、模型调用和候选源码。`pipeline_timeline.html` 汇总工作时间。指定版本数时自动开启模型调用日志，不记录 HTTP 鉴权头。

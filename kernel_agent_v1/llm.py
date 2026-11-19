@@ -5,6 +5,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 import asyncio
 from dataclasses import dataclass, field
+import hashlib
 import json
 import os
 from typing import TYPE_CHECKING, Any, Callable
@@ -256,6 +257,18 @@ class DeepSeekResearcherAdapter:
         self.leader = leader
         self.task_definition = task_definition
 
+    async def propose_branch(self, context: dict[str, Any]) -> tuple[dict[str, Any], LLMUsage]:
+        return await _complete_json(self.llm, [
+            LLMMessage("system", (
+                "All known GDN optimization branches have stopped. Propose one new, testable "
+                "optimization mechanism distinct from every listed route. Return a JSON object "
+                "with parent_direction_id, hypothesis, mechanism, falsification_test, and receipt_id. "
+                "Use an existing parent and a supplied receipt from that route. "
+                "Use the full benchmark and reference correctness to test the hypothesis."
+            )),
+            LLMMessage("user", json.dumps(context, ensure_ascii=False)),
+        ])
+
     async def plan_from_evidence(
         self,
         researcher_id: str,
@@ -264,6 +277,7 @@ class DeepSeekResearcherAdapter:
         default_target: TargetRef,
         *,
         repair_context: dict[str, Any] | None = None,
+        parent_files: dict[str, str] | None = None,
         dual_research: DualResearch | None = None,
         generation_feedback: str | None = None,
     ) -> tuple[Command, dict[str, Any], LLMUsage]:
@@ -318,6 +332,13 @@ class DeepSeekResearcherAdapter:
         if generation_feedback:
             user_payload["previous_generation_failure"] = generation_feedback
             sys_prompt += " Address the previous generation failure in your new plan."
+        if parent_files is not None:
+            user_payload["parent_files"] = parent_files
+            sys_prompt += (
+                " The Wiki route_context.hypothesis is the assigned optimization direction. "
+                "Stay within it. Propose one concrete change using the supplied parent source, "
+                "and return an implement_kernel instruction."
+            )
         if self.task_definition is not None:
             user_payload["task_definition"] = self.task_definition
         if repair_context is not None:
@@ -435,7 +456,8 @@ class DeepSeekResearcherAdapter:
 
         cmd = self.leader.build_command(
             kind=(
-                CommandKind.IMPLEMENT_KERNEL.value if repair_context is not None or dual_research is not None
+                CommandKind.IMPLEMENT_KERNEL.value
+                if repair_context is not None or parent_files is not None or dual_research is not None
                 else str(parsed.get("command_kind", CommandKind.IMPLEMENT_KERNEL.value))
             ),
             research_id=rid,
@@ -449,10 +471,11 @@ class DeepSeekResearcherAdapter:
             workload_ids=tuple(parsed.get("workload_ids", ())),
             allowed_paths=(
                 tuple(repair_context["files"]) if repair_context is not None
+                else ("kernel.py",) if parent_files is not None
                 else tuple(parsed.get("allowed_paths", ()))
             ),
             preserve_target=(
-                False if repair_context is not None
+                False if repair_context is not None or parent_files is not None
                 else bool(parsed.get("preserve_target", True))
             ),
         )
@@ -470,7 +493,12 @@ class DeepSeekCoderAdapter:
         self.task_definition = task_definition
 
     async def implement(
-        self, command: Command, *, repair_context: dict[str, Any] | None = None
+        self,
+        command: Command,
+        *,
+        repair_context: dict[str, Any] | None = None,
+        parent_files: dict[str, str] | None = None,
+        content_addressed: bool = False,
     ) -> tuple[Event, CodePackage | None, LLMUsage]:
         sys_prompt = (
             "You are KernelLab Coder. Output valid JSON with keys: artifact_id, entrypoint "
@@ -491,6 +519,9 @@ class DeepSeekCoderAdapter:
                 " Use the failed source and diagnostic in repair_context to implement "
                 "the Leader's repair instruction. Return the complete corrected files."
             )
+        if parent_files is not None:
+            user_payload["parent_files"] = parent_files
+            sys_prompt += " Apply the instruction to the supplied parent source."
         parsed, usage = await _complete_json(
             self.llm,
             [
@@ -498,8 +529,19 @@ class DeepSeekCoderAdapter:
                 LLMMessage("user", json.dumps(user_payload, ensure_ascii=False)),
             ],
         )
-        if repair_context is not None:
+        if repair_context is not None or content_addressed:
             parsed.pop("package_id", None)
             parsed.pop("artifact_id", None)
+        if content_addressed:
+            files = parsed.get("files")
+            if not isinstance(files, dict) or not files or not all(isinstance(v, str) for v in files.values()):
+                evt, pkg = self.coder.execute_command(command, {
+                    "blocked_reason": "Expected a nonempty files object with source text values",
+                })
+                return evt, pkg, usage
+            contents = json.dumps(
+                [parsed.get("entrypoint") or "kernel.py", files], sort_keys=True
+            ).encode()
+            parsed["artifact_id"] = "gdn-" + hashlib.sha256(contents).hexdigest()
         evt, pkg = self.coder.execute_command(command, provided_spec=parsed)
         return evt, pkg, usage

@@ -199,6 +199,12 @@ class AsyncKernelLabRunner:
                     and not (self._inflight_bg_tasks - self._diagnosis_tasks)
                     and self._event_queue.empty()
                 ):
+                    if self.hooks.on_idle_check is not None:
+                        spawned = await self.hooks.on_idle_check(rt)
+                        if spawned:
+                            self._try_dispatch_gpu()
+                            continue
+
                     if (
                         rt.controller.active_version is None
                         and (
@@ -206,19 +212,13 @@ class AsyncKernelLabRunner:
                             or rt.controller.ledger.admission_frozen
                             or rt.controller.version_cap_reached
                         )
-                        and (rt.config.max_versions is None or rt.controller.version_cap_reached)
+                        and rt.controller.version_search_finished
                         and rt.controller.global_best_version_id is not None
                         and not rt.controller.final_eval_requested
                     ):
                         with rt.timeline.measure("Controller", "Schedule final evaluation"):
                             rt.controller.schedule_final_eval()
                         if self._try_dispatch_gpu():
-                            continue
-
-                    if self.hooks.on_idle_check is not None:
-                        spawned = await self.hooks.on_idle_check(rt)
-                        if spawned:
-                            self._try_dispatch_gpu()
                             continue
 
                     if not self._try_dispatch_gpu() and not self._diagnosis_tasks:

@@ -12,6 +12,7 @@ from pathlib import Path
 import sys
 import tempfile
 import traceback
+from typing import Any
 from urllib.error import HTTPError
 
 from kernel_agent_v1.async_runtime import AsyncKernelLabRunner, AsyncRunnerHooks
@@ -21,6 +22,7 @@ from kernel_agent_v1.closed_loop_tester import ClosedLoopTester
 from kernel_agent_v1.dual_research import DualResearch
 from kernel_agent_v1.evaluator import FINAL_BLOCK_IDS, TrustedEvaluator
 from kernel_agent_v1.experiments import format_comparison_report, run_three_way_comparison
+from kernel_agent_v1.gdn_campaign import GDN_CANDIDATE_FAILURES, GDN_ROOT_ROUTE, GdnRouteCampaign
 from kernel_agent_v1.gdn_task import load_official_definition, seed_gdn_candidate_source
 from kernel_agent_v1.llm import (
     DeepSeekClient,
@@ -116,16 +118,15 @@ def _run_end_to_end(args: argparse.Namespace) -> int:
     if args.gpu_budget_s is not None:
         budgets.total_gpu_budget_s = args.gpu_budget_s
 
+    route_campaign = args.max_versions is not None and args.deepseek_live
     cfg = RuntimeConfig(
         run_id=args.run_id,
         gpu_name=args.gpu,
         scheduler_mode=args.scheduler,
         max_versions=args.max_versions,
+        finalize_when_admission_frozen=route_campaign,
         budgets=budgets,
     )
-    if args.max_versions is not None:
-        # This campaign is explicitly version-limited, including non-improving versions.
-        cfg.stagnation_limit = max(cfg.stagnation_limit, args.max_versions)
     evaluator = TrustedEvaluator.from_official_gdn_dataset(
         device_id=f"{cfg.gpu_name}:0",
         min_gain_threshold=cfg.min_gain_threshold,
@@ -171,18 +172,18 @@ def _run_end_to_end(args: argparse.Namespace) -> int:
     rt.coder.enforce_gdn_abi = True
 
     rt.register_route(
-        direction_id="gdn-prefill-main",
+        direction_id=GDN_ROOT_ROUTE,
         hypothesis="Optimize GDN prefill k-last kernel on target GPU using official gdn-unified-v2 workloads",
         priority=2.0,
         researcher_id="res_main",
     )
 
     # Seed Round 0 candidate matching exact GDN ABI
-    lookup = rt.wiki.query(cfg.gpu_name, "gdn-prefill-main", ("gdn", "l4", "sm89"), clock.now_iso())
+    lookup = rt.wiki.query(cfg.gpu_name, GDN_ROOT_ROUTE, ("gdn", "l4", "sm89"), clock.now_iso())
     seed_cmd = rt.leader.build_command(
         kind=CommandKind.IMPLEMENT_KERNEL.value,
         research_id=rt.leader.next_research_id(),
-        direction_id="gdn-prefill-main",
+        direction_id=GDN_ROOT_ROUTE,
         target=TargetRef("V0", "fla-baseline"),
         hypothesis="Seed verified GDN prefill baseline candidate",
         evidence_refs=(lookup.lookup_id,),
@@ -204,6 +205,7 @@ def _run_end_to_end(args: argparse.Namespace) -> int:
     if seed_pkg is None:
         print(f"Failed to package seed candidate: {seed_evt.to_dict()}", file=sys.stderr)
         return 2
+    known_sources = {tuple(sorted(seed_pkg.manifest.file_digests.items()))}
 
     # Inject candidate_path (and incumbent_path for ABBA) into RealSingleGpuBackend inputs
     if args.backend == "real-gpu":
@@ -251,24 +253,99 @@ def _run_end_to_end(args: argparse.Namespace) -> int:
         if args.dual_researcher else None
     )
 
+    async def _generate_candidate(
+        direction_id: str,
+        deliveries: list[EvidenceDelivery],
+        target: TargetRef,
+        repair_context: dict[str, Any] | None,
+        parent_files: dict[str, str] | None,
+    ) -> bool:
+        feedback = None
+        delivery = deliveries[0] if deliveries else None
+        trigger = delivery.receipt_id if delivery else target.version_id
+        for _ in range(3 if route_campaign else 1):
+            if rt.controller.version_cap_reached or rt.controller.ledger.admission_frozen:
+                return False
+            try:
+                design_role = "Design" if dual_research is not None else "Leader"
+                with rt.timeline.measure(design_role, f"Plan from {trigger}"):
+                    cmd, plan, usage = await res_adapter.plan_from_evidence(
+                        researcher_id="res_main",
+                        direction_id=direction_id,
+                        deliveries=deliveries,
+                        repair_context=repair_context,
+                        parent_files=parent_files,
+                        dual_research=dual_research,
+                        generation_feedback=feedback,
+                        default_target=target,
+                    )
+            except LLMResponseFormatError as exc:
+                rt.controller.ledger.model_cost_used += exc.usage.cost_usd
+                print(
+                    f"[model-error] stage=researcher version={target.version_id} "
+                    f"receipt={trigger} error={exc}",
+                    file=sys.stderr,
+                )
+                feedback = str(exc)
+                continue
+            rt.controller.ledger.model_cost_used += usage.cost_usd
+            rt.store.write_evidence(f"command-{cmd.head.command_id}", cmd.to_dict())
+            if "diagnosis_feedback" in plan:
+                rt.store.write_evidence(f"design-{cmd.head.command_id}", {
+                    "command_id": cmd.head.command_id,
+                    "trigger_receipt_id": trigger,
+                    "version_id": target.version_id,
+                    "issued_at_s": rt.clock.now(),
+                    **plan["diagnosis_feedback"],
+                })
+            try:
+                with rt.timeline.measure("Coder", f"Implement {cmd.head.command_id}") as span:
+                    evt, pkg, usage = await coder_adapter.implement(
+                        cmd, repair_context=repair_context, parent_files=parent_files,
+                        content_addressed=route_campaign,
+                    )
+                    span.status = evt.event
+            except LLMResponseFormatError as exc:
+                usage = exc.usage
+                evt, pkg = rt.coder.execute_command(cmd, {"blocked_reason": str(exc)})
+            rt.controller.ledger.model_cost_used += usage.cost_usd
+            if pkg is not None:
+                source_key = tuple(sorted(pkg.manifest.file_digests.items()))
+                if route_campaign and source_key in known_sources:
+                    feedback = "The proposed source is byte-identical to an earlier candidate. Produce a distinct change."
+                    rt.store.write_evidence(f"duplicate-{cmd.head.command_id}", {
+                        "direction_id": direction_id, "package_id": pkg.manifest.package_id,
+                        "file_digests": pkg.manifest.file_digests,
+                    })
+                    continue
+                known_sources.add(source_key)
+                rt.packages_by_id[pkg.manifest.package_id] = pkg
+                if route_campaign:
+                    rt.wiki.route_tree.record_experiment_submission(
+                        cmd.head.command_id, direction_id, target.version_id, pkg.manifest.artifact_id,
+                        cmd.body.instruction, cmd.body.constraints.workload_ids,
+                    )
+            else:
+                print(
+                    f"[coder-blocked] cmd={cmd.head.command_id} details={evt.extra}",
+                    file=sys.stderr,
+                )
+            await runner.submit_external_event(evt)
+            if pkg is not None:
+                return True
+            feedback = json.dumps(evt.extra, ensure_ascii=False)
+        return False
+
     async def _on_evidence(runtime: KernelLabRuntime, delivery: EvidenceDelivery) -> None:
-        if (
-            not args.deepseek_live
-            or runtime.controller.version_cap_reached
-            or (args.max_versions is None and rounds_remaining[0] <= 0)
-        ):
+        if not args.deepseek_live or rounds_remaining[0] <= 0:
             return
         if delivery.result_kind not in (
-            ResultKind.BENCHMARK_PARTIAL.value,
-            ResultKind.NCU_PARSED.value,
-            ResultKind.PROBE_RESULT.value,
+            ResultKind.BENCHMARK_PARTIAL.value, ResultKind.NCU_PARSED.value, ResultKind.PROBE_RESULT.value,
         ):
             return
         status = delivery.payload.get("status")
         repair_context = None
-        if delivery.result_kind == ResultKind.BENCHMARK_PARTIAL.value and status in (
-            "compile_failed", "candidate_failed", "numerical_failed"
-        ):
+        if delivery.result_kind == ResultKind.BENCHMARK_PARTIAL.value and status in GDN_CANDIDATE_FAILURES:
             failed_package = runtime.packages_by_id.get(delivery.payload.get("package_id"))
             if failed_package is None:
                 print(f"[repair] missing source for {delivery.receipt_id}", file=sys.stderr)
@@ -285,68 +362,15 @@ def _run_end_to_end(args: argparse.Namespace) -> int:
             delivery.block_id and delivery.block_id != "W1"
         ):
             return
-        if args.max_versions is None:
-            rounds_remaining[0] -= 1
-        feedback = None
-        for _ in range(3 if args.max_versions is not None else 1):
-            if runtime.controller.version_cap_reached or runtime.controller.ledger.admission_frozen:
-                return
-            try:
-                design_role = "Design" if dual_research is not None else "Leader"
-                with runtime.timeline.measure(design_role, f"Plan from {delivery.receipt_id}"):
-                    cmd, plan, usage = await res_adapter.plan_from_evidence(
-                        researcher_id="res_main",
-                        direction_id="gdn-prefill-main",
-                        deliveries=[delivery],
-                        repair_context=repair_context,
-                        dual_research=dual_research,
-                        generation_feedback=feedback,
-                        default_target=TargetRef(
-                            delivery.version_id or "V1", delivery.artifact_id or "art-seed-v0"
-                        ),
-                    )
-            except LLMResponseFormatError as exc:
-                runtime.controller.ledger.model_cost_used += exc.usage.cost_usd
-                print(
-                    f"[model-error] stage=researcher version={delivery.version_id} "
-                    f"receipt={delivery.receipt_id} error={exc}",
-                    file=sys.stderr,
-                )
-                feedback = str(exc)
-                continue
-            runtime.controller.ledger.model_cost_used += usage.cost_usd
-            runtime.store.write_evidence(f"command-{cmd.head.command_id}", cmd.to_dict())
-            if "diagnosis_feedback" in plan:
-                runtime.store.write_evidence(f"design-{cmd.head.command_id}", {
-                    "command_id": cmd.head.command_id,
-                    "trigger_receipt_id": delivery.receipt_id,
-                    "version_id": delivery.version_id,
-                    "issued_at_s": runtime.clock.now(),
-                    **plan["diagnosis_feedback"],
-                })
-            try:
-                with runtime.timeline.measure("Coder", f"Implement {cmd.head.command_id}") as span:
-                    evt, pkg, usage = await coder_adapter.implement(cmd, repair_context=repair_context)
-                    span.status = evt.event
-            except LLMResponseFormatError as exc:
-                usage = exc.usage
-                evt, pkg = runtime.coder.execute_command(cmd, {"blocked_reason": str(exc)})
-            runtime.controller.ledger.model_cost_used += usage.cost_usd
-            if pkg is not None:
-                runtime.packages_by_id[pkg.manifest.package_id] = pkg
-            else:
-                print(
-                    f"[coder-blocked] cmd={cmd.head.command_id} details={evt.extra}",
-                    file=sys.stderr,
-                )
-            await runner.submit_external_event(evt)
-            if pkg is not None:
-                return
-            feedback = json.dumps(evt.extra, ensure_ascii=False)
+        rounds_remaining[0] -= 1
+        target = TargetRef(delivery.version_id or "V1", delivery.artifact_id or "art-seed-v0")
+        await _generate_candidate(GDN_ROOT_ROUTE, [delivery], target, repair_context, None)
 
+    campaign = GdnRouteCampaign(rt, _generate_candidate, res_adapter) if route_campaign else None
     runner = AsyncKernelLabRunner(
         rt, hooks=AsyncRunnerHooks(
-            on_research_evidence=_on_evidence,
+            on_research_evidence=None if campaign else _on_evidence,
+            on_idle_check=campaign.advance if campaign else None,
             on_diagnosis_evidence=dual_research.diagnose if dual_research else None,
         )
     )
@@ -377,6 +401,7 @@ def _run_end_to_end(args: argparse.Namespace) -> int:
     result.update({
         "status": "completed" if rt.controller.final_eval_completed else "incomplete",
         "target_version": args.max_versions,
+        "version_cap_reached": rt.controller.version_cap_reached,
         "last_admitted_version": rt.controller.version_seq,
         "last_admitted_version_closed": f"V{rt.controller.version_seq}" in rt.controller.closed_versions,
         "final_eval_score": rt.judge.incumbent.final_eval_score,
@@ -457,7 +482,7 @@ def main(argv: list[str] | None = None) -> int:
     limits.add_argument("--max-rounds", type=int, default=3, help="Maximum model proposal rounds.")
     limits.add_argument(
         "--max-versions", type=int,
-        help="Include seed V1 in the version count and run final evaluation only after the target closes.",
+        help="Global version cap including seed V1. Route exhaustion can end the search earlier.",
     )
     run_p.add_argument("--audit-llm", action="store_true", help="Persist model requests and responses.")
     run_p.add_argument(

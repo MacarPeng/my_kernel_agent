@@ -803,14 +803,25 @@ class Controller:
             len(BLOCK_IDS) * b.reserve_required_block_s + b.reserve_retest_s + final_reserve
         )
         if gpu_rem < min_version_need or wall_rem < min_version_need or model_rem <= 0:
-            if not self.ledger.admission_frozen:
-                self.ledger.admission_frozen = True
-                self.ledger.freeze_reason = "budget_near_exhaustion"
+            self.freeze_admissions("budget_near_exhaustion")
+
+    def freeze_admissions(self, reason: str) -> None:
+        if not self.ledger.admission_frozen:
+            self.ledger.admission_frozen = True
+            self.ledger.freeze_reason = reason
 
     @property
     def version_cap_reached(self) -> bool:
         cap = self.config.max_versions
         return cap is not None and self.version_seq >= cap
+
+    @property
+    def version_search_finished(self) -> bool:
+        return (
+            self.config.max_versions is None
+            or self.version_cap_reached
+            or (self.config.finalize_when_admission_frozen and self.ledger.admission_frozen)
+        )
 
     def admit_next_version(self) -> VersionRecord | None:
         """Admit Vn+1 from pending candidates ONLY when no version is active/closing and GPU is clean."""
@@ -852,7 +863,8 @@ class Controller:
         self.store.append_lifecycle({
             "event": "version_admitted", "timestamp": self.clock.now_iso(),
             "version_id": vid, "artifact_id": chosen["artifact_id"],
-            "package_id": chosen.get("package_id"),
+            "package_id": chosen.get("package_id"), "direction_id": chosen_dir,
+            "source_parent_version": chosen.get("parent_version_id") or "V0",
         })
         art_id = str(chosen["artifact_id"])
         parent_vid = str(chosen.get("parent_version_id") or "V0")
@@ -944,7 +956,7 @@ class Controller:
             self.final_eval_requested
             or self.active_version is not None
             or self.gpu_busy
-            or (self.config.max_versions is not None and not self.version_cap_reached)
+            or not self.version_search_finished
             or self.global_best_version_id is None
             or self.global_best_artifact_id is None
         ):
