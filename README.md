@@ -61,3 +61,5 @@ python3 -m kernel_agent_v1.cli run --backend real-gpu --gpu NVIDIA-L4 --run-dir 
 export DEEPSEEK_API_KEY="sk-..."
 python3 -m kernel_agent_v1.cli run --backend real-gpu --gpu NVIDIA-L4 --run-dir /content/drive/MyDrive/kernellab_runs/run1 --deepseek-live --max-rounds 4
 ```
+
+实卡运行时，`--final-eval-timeout-s` 控制 `F1`、`F2`、`F3` 各自的超时，默认 3600 秒。默认墙钟和 GPU 调度预算会按三块终评的超时总和预留时间。手动指定的 `--wall-budget-s` 和 `--gpu-budget-s` 是整轮预算，需将终评时间计入。

@@ -453,6 +453,7 @@ class BudgetConfig:
     default_job_timeout_s: float = 180.0
     max_compile_correctness_repairs: int = 2
     max_infra_retries: int = 1
+    final_eval_job_timeout_s: float | None = None
 
 
 @dataclass

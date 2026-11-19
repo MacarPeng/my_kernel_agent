@@ -207,9 +207,10 @@ class AsyncKernelLabRunner:
 
         rt.controller.run_finished = True
         if not rt.controller.stop_reason:
-            rt.controller.stop_reason = (
-                rt.controller.ledger.freeze_reason or "completed"
-            )
+            if rt.controller.final_eval_requested and not rt.controller.final_eval_completed:
+                rt.controller.stop_reason = "final_eval_incomplete"
+            else:
+                rt.controller.stop_reason = rt.controller.ledger.freeze_reason or "completed"
         rt.controller.flush_snapshot()
 
         wall_s = rt.clock.now() - start_wall

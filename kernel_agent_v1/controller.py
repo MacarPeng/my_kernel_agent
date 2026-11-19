@@ -792,6 +792,8 @@ class Controller:
         return True, None
 
     def _check_budget_limits(self) -> None:
+        if self.final_eval_requested:
+            return  # Admissions are closed while final eval consumes its reserve.
         b = self.config.budgets
         now = self.clock.now()
         wall_elapsed = now - self.ledger.wall_start_s
@@ -946,6 +948,8 @@ class Controller:
         package_id = self._benchmark_package_id(
             self.global_best_version_id, self.global_best_artifact_id
         )
+        budgets = self.config.budgets
+        timeout_s = budgets.final_eval_job_timeout_s or budgets.default_job_timeout_s
         now = self.clock.now()
         created: list[TaskSpec] = []
         for fb in FINAL_BLOCK_IDS:
@@ -963,7 +967,7 @@ class Controller:
                 priority=1000.0,
                 reply_to="judge",
                 ready_at=now,
-                timeout_s=self.config.budgets.default_job_timeout_s,
+                timeout_s=timeout_s,
             )
             self.tasks[tid] = spec
             created.append(spec)

@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import math
 from pathlib import Path
 import sys
 import tempfile
@@ -13,7 +14,7 @@ from kernel_agent_v1.async_runtime import AsyncKernelLabRunner, AsyncRunnerHooks
 from kernel_agent_v1.backends import RealSingleGpuBackend, SimulatedExecutionBackend
 from kernel_agent_v1.clock import RealClock, SimClock
 from kernel_agent_v1.closed_loop_tester import ClosedLoopTester
-from kernel_agent_v1.evaluator import TrustedEvaluator
+from kernel_agent_v1.evaluator import FINAL_BLOCK_IDS, TrustedEvaluator
 from kernel_agent_v1.experiments import format_comparison_report, run_three_way_comparison
 from kernel_agent_v1.gdn_task import seed_gdn_candidate_source
 from kernel_agent_v1.llm import (
@@ -34,16 +35,34 @@ from kernel_agent_v1.protocol import (
 from kernel_agent_v1.runtime import KernelLabRuntime
 
 
+def _positive_seconds(value: str) -> float:
+    seconds = float(value)
+    if not math.isfinite(seconds) or seconds <= 0:
+        raise argparse.ArgumentTypeError("expected a positive, finite number of seconds")
+    return seconds
+
+
 def _run_end_to_end(args: argparse.Namespace) -> int:
     run_dir = Path(args.run_dir) if args.run_dir else Path(tempfile.mkdtemp(prefix="kl-run-"))
+    budgets = BudgetConfig(total_wall_budget_s=1800.0, total_gpu_budget_s=1200.0)
+    final_timeout_s = args.final_eval_timeout_s
+    if final_timeout_s is None and args.backend == "real-gpu":
+        final_timeout_s = 3600.0
+    if final_timeout_s is not None:
+        budgets.final_eval_job_timeout_s = final_timeout_s
+        budgets.reserve_final_eval_s = len(FINAL_BLOCK_IDS) * final_timeout_s
+        budgets.total_wall_budget_s += budgets.reserve_final_eval_s
+        budgets.total_gpu_budget_s += budgets.reserve_final_eval_s
+    if args.wall_budget_s is not None:
+        budgets.total_wall_budget_s = args.wall_budget_s
+    if args.gpu_budget_s is not None:
+        budgets.total_gpu_budget_s = args.gpu_budget_s
+
     cfg = RuntimeConfig(
         run_id=args.run_id,
         gpu_name=args.gpu,
         scheduler_mode=args.scheduler,
-        budgets=BudgetConfig(
-            total_wall_budget_s=float(args.wall_budget_s),
-            total_gpu_budget_s=float(args.gpu_budget_s),
-        ),
+        budgets=budgets,
     )
     evaluator = TrustedEvaluator.from_official_gdn_dataset(
         device_id=f"{cfg.gpu_name}:0",
@@ -200,7 +219,7 @@ def _run_end_to_end(args: argparse.Namespace) -> int:
     runner = AsyncKernelLabRunner(
         rt, hooks=AsyncRunnerHooks(on_research_evidence=_on_evidence)
     )
-    metrics = asyncio.run(runner.run(max_wall_s=float(args.wall_budget_s)))
+    metrics = asyncio.run(runner.run())
     # Surface any job execution errors clearly in stderr for immediate diagnostics
     for _, evt in rt.store.load_events():
         err = evt.extra.get("error")
@@ -250,8 +269,18 @@ def main(argv: list[str] | None = None) -> int:
         choices=("chunked_dynamic", "chunked_fcfs", "whole_round"),
         default="chunked_dynamic",
     )
-    run_p.add_argument("--wall-budget-s", type=float, default=1800.0)
-    run_p.add_argument("--gpu-budget-s", type=float, default=1200.0)
+    run_p.add_argument(
+        "--wall-budget-s", type=float,
+        help="Total wall-clock budget in seconds. Default: 1800 plus the final-eval reserve on real GPU.",
+    )
+    run_p.add_argument(
+        "--gpu-budget-s", type=float,
+        help="Total GPU scheduling budget in seconds. Default: 1200 plus the final-eval reserve on real GPU.",
+    )
+    run_p.add_argument(
+        "--final-eval-timeout-s", type=_positive_seconds,
+        help="Timeout per final-eval block in seconds. Default: 3600 on real GPU.",
+    )
     run_p.add_argument("--max-rounds", type=int, default=3)
     run_p.add_argument("--smoke-cases", type=int, default=0)
     run_p.add_argument("--deepseek-live", action="store_true")

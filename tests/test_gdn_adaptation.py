@@ -10,6 +10,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+from kernel_agent_v1.backends import SimulatedExecutionBackend
 from kernel_agent_v1.cli import main as cli_main
 from kernel_agent_v1.clock import SimClock
 from kernel_agent_v1.coder import Coder
@@ -108,6 +109,43 @@ class TestGdnAdaptation(unittest.TestCase):
                 ]
             )
             self.assertEqual(rc, 0)
+
+    def test_real_gpu_cli_reserves_time_for_three_long_final_blocks(self) -> None:
+        class TimedBackend(SimulatedExecutionBackend):
+            async def async_wait(self, handle, clock, poll_interval_s=0.01):
+                clock.advance_to(min(handle.expected_finish_at, handle.timeout_at))
+                if handle.expected_finish_at > handle.timeout_at:
+                    handle.metadata["behavior"]["timeout"] = True
+                return self.wait(handle, clock)
+
+        for timeout_override, final_timeout in ((None, 3600), (3000, 3000), (2000, 2000)):
+            with self.subTest(final_timeout=final_timeout), tempfile.TemporaryDirectory() as tmp:
+                evaluator = TrustedEvaluator.from_official_gdn_dataset()
+                backend = TimedBackend(evaluator)
+                backend.set_behavior("benchmark_block", {"duration_s": 115.0, "speedup": 1.2})
+                backend.set_behavior("final_eval", {"duration_s": 2500.0, "speedup": 1.2})
+                args = ["run", "--backend", "real-gpu", "--run-dir", tmp]
+                if timeout_override is not None:
+                    args += ["--final-eval-timeout-s", str(timeout_override)]
+                stdout = StringIO()
+                with patch("kernel_agent_v1.cli.RealClock", return_value=SimClock()), \
+                     patch("kernel_agent_v1.cli.RealSingleGpuBackend", return_value=backend), \
+                     redirect_stdout(stdout), redirect_stderr(StringIO()):
+                    rc = cli_main(args)
+
+                self.assertEqual(rc, 0)
+                metrics = json.loads(stdout.getvalue())
+                if final_timeout >= 2500:
+                    self.assertEqual(metrics["verification_level"], "final_verified")
+                    self.assertEqual(metrics["stop_reason"], "completed")
+                else:
+                    self.assertEqual(metrics["verification_level"], "block_verified")
+                    self.assertEqual(metrics["stop_reason"], "final_eval_incomplete")
+                self.assertEqual(metrics["total_wall_s"], 4 * 115 + 3 * min(final_timeout, 2500))
+                tasks = RunStore(tmp).load_snapshot()["tasks"].values()
+                blocks = {t["block_id"]: t["timeout_s"] for t in tasks if t["kind"] == "final_eval"}
+                self.assertEqual(blocks, {"F1": final_timeout, "F2": final_timeout, "F3": final_timeout})
+                self.assertEqual({t["timeout_s"] for t in tasks if t["kind"] == "benchmark_block"}, {180.0})
 
     def test_invalid_model_replies_allow_seed_evaluation_to_finish(self) -> None:
         plan = {"allowed_paths": ["kernel.py"], "preserve_target": False}
