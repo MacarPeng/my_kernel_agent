@@ -54,24 +54,49 @@ class LLMUsage:
     total_tokens: int = 0
     cost_usd: float = 0.0
 
+    def __add__(self, other: LLMUsage) -> LLMUsage:
+        return LLMUsage(
+            prompt_tokens=self.prompt_tokens + other.prompt_tokens,
+            completion_tokens=self.completion_tokens + other.completion_tokens,
+            total_tokens=self.total_tokens + other.total_tokens,
+            cost_usd=self.cost_usd + other.cost_usd,
+        )
+
+
+class LLMResponseFormatError(ValueError):
+    """A structured response could not be decoded after retrying."""
+
+    def __init__(self, message: str, usage: LLMUsage) -> None:
+        super().__init__(message)
+        self.usage = usage
+
 
 @dataclass(frozen=True)
 class LLMResponse:
-    content: str
+    content: str | None
     model: str
     usage: LLMUsage = field(default_factory=LLMUsage)
     raw: dict[str, Any] = field(default_factory=dict)
 
     def parse_json(self) -> dict[str, Any]:
-        text = self.content.strip()
-        if text.startswith("```"):
-            lines = text.splitlines()
-            if lines[0].startswith("```"):
-                lines = lines[1:]
-            if lines and lines[-1].strip().startswith("```"):
-                lines = lines[:-1]
-            text = "\n".join(lines).strip()
-        return json.loads(text)
+        choices = self.raw.get("choices") or []
+        finish_reason = choices[0].get("finish_reason") if choices else None
+        if finish_reason == "length":
+            raise ValueError("JSON response truncated at the token limit")
+        text = self.content.strip() if isinstance(self.content, str) else ""
+        if not text:
+            raise ValueError("empty response content")
+        lines = text.splitlines()
+        if (
+            len(lines) >= 2
+            and lines[0].strip().lower() in ("```", "```json")
+            and lines[-1].strip() == "```"
+        ):
+            text = "\n".join(lines[1:-1]).strip()
+        parsed = json.loads(text)
+        if not isinstance(parsed, dict):
+            raise ValueError("expected a JSON object")
+        return parsed
 
 
 class LLMClient(ABC):
@@ -82,6 +107,31 @@ class LLMClient(ABC):
         self, messages: list[LLMMessage], *, json_mode: bool = True
     ) -> LLMResponse:
         """Send chat completion request and return structured response + token cost."""
+
+
+async def _complete_json(
+    llm: LLMClient, messages: list[LLMMessage]
+) -> tuple[dict[str, Any], LLMUsage]:
+    usage = LLMUsage()
+    for attempt in range(2):
+        response = await llm.complete(messages, json_mode=True)
+        usage += response.usage
+        try:
+            return response.parse_json(), usage
+        except ValueError as exc:
+            if attempt == 1:
+                raise LLMResponseFormatError(
+                    f"invalid JSON after 2 attempts ({exc})", usage
+                ) from exc
+            system, *rest = messages
+            messages = [
+                LLMMessage(
+                    system.role,
+                    system.content + "\nReturn exactly one complete, compact JSON object "
+                    "matching the example. Omit Markdown and surrounding prose.",
+                ),
+                *rest,
+            ]
 
 
 class DeepSeekClient(LLMClient):
@@ -142,7 +192,8 @@ class DeepSeekClient(LLMClient):
         with urllib.request.urlopen(req, timeout=self.config.timeout_s) as resp:
             raw = json.loads(resp.read().decode("utf-8"))
 
-        content = raw["choices"][0]["message"]["content"]
+        choices = raw.get("choices") or []
+        content = (choices[0].get("message") or {}).get("content") if choices else None
         u = raw.get("usage", {})
         pt = int(u.get("prompt_tokens", 0))
         ct = int(u.get("completion_tokens", 0))
@@ -228,7 +279,11 @@ class DeepSeekResearcherAdapter:
             "instruction, deliverable, allowed_paths (use ['kernel.py'] for implement_kernel), "
             "workload_ids, preserve_target (false for implement_kernel). "
             "For implement_kernel, kernel.py MUST define "
-            "run(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale) -> (output, new_state)."
+            "run(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale) -> (output, new_state). "
+            'Example JSON: {"observation":"W1 long cases are slow","explanation":"launch overhead",'
+            '"prediction":"fewer launches reduce latency","hypothesis":"fuse the gating step",'
+            '"command_kind":"implement_kernel","instruction":"fuse gating and update",'
+            '"deliverable":"kernel.py","allowed_paths":["kernel.py"],"workload_ids":[],"preserve_target":false}'
         )
         user_payload = {
             "research_id": rid,
@@ -250,14 +305,13 @@ class DeepSeekResearcherAdapter:
                 "artifact_id": default_target.artifact_id,
             },
         }
-        resp = await self.llm.complete(
+        parsed, usage = await _complete_json(
+            self.llm,
             [
                 LLMMessage("system", sys_prompt),
                 LLMMessage("user", json.dumps(user_payload, ensure_ascii=False)),
             ],
-            json_mode=True,
         )
-        parsed = resp.parse_json()
 
         evidence_refs = (lookup.lookup_id,) + tuple(d.receipt_id for d in deliveries)
         # Record structured research note once, reusing the mandatory initial Wiki lookup
@@ -301,7 +355,7 @@ class DeepSeekResearcherAdapter:
             allowed_paths=tuple(parsed.get("allowed_paths", ())),
             preserve_target=bool(parsed.get("preserve_target", True)),
         )
-        return cmd, parsed, resp.usage
+        return cmd, parsed, usage
 
 
 class DeepSeekCoderAdapter:
@@ -320,15 +374,16 @@ class DeepSeekCoderAdapter:
             "executable_stages. Strictly stay inside allowed_paths. Only import from "
             "triton, torch, math, typing, functools (no os/sys/eval/open). For implement_kernel, "
             "kernel.py MUST define run(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale) "
-            "returning (output_bf16, new_state_fp32)."
+            "returning (output_bf16, new_state_fp32). "
+            'Example JSON shape: {"artifact_id":"gdn-fused","entrypoint":"kernel.py",'
+            '"files":{"kernel.py":"<complete implementation>"}}'
         )
-        resp = await self.llm.complete(
+        parsed, usage = await _complete_json(
+            self.llm,
             [
                 LLMMessage("system", sys_prompt),
                 LLMMessage("user", json.dumps(command.to_dict(), ensure_ascii=False)),
             ],
-            json_mode=True,
         )
-        parsed = resp.parse_json()
         evt, pkg = self.coder.execute_command(command, provided_spec=parsed)
-        return evt, pkg, resp.usage
+        return evt, pkg, usage

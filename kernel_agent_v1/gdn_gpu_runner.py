@@ -122,6 +122,7 @@ def _run_benchmark_block(inputs: dict[str, Any], torch_mod) -> dict[str, Any]:
     by_uuid = {r["uuid"]: r for r in rows}
 
     block_id = str(inputs.get("block_id", "W1"))
+    attempt_id = inputs["attempt_id"]
     uuids = blocks[block_id]
     device = "cuda:0" if torch_mod.cuda.is_available() else "cpu"
     device_name = (
@@ -170,7 +171,7 @@ def _run_benchmark_block(inputs: dict[str, Any], torch_mod) -> dict[str, Any]:
                 "version_id": inputs.get("version_id"),
                 "protocol": "gdn-unified-v2",
                 "device_id": inputs.get("device_id", device_name),
-                "attempt_id": inputs.get("attempt_id", "gpu/1"),
+                "attempt_id": attempt_id,
             }
         )
 
@@ -180,7 +181,7 @@ def _run_benchmark_block(inputs: dict[str, Any], torch_mod) -> dict[str, Any]:
         "artifact_id": inputs.get("artifact_id"),
         "protocol": "gdn-unified-v2",
         "device_id": inputs.get("device_id", device_name),
-        "attempt_id": inputs.get("attempt_id", "gpu/1"),
+        "attempt_id": attempt_id,
         "cases": cases,
     }
 
@@ -238,6 +239,8 @@ def _run_abba_retest(inputs: dict[str, Any], torch_mod) -> dict[str, Any]:
     ref_fn = _build_reference_fn(defn)
     cand_fn = _load_python_entrypoint(Path(inputs["candidate_path"]), "abba_cand").run
     inc_path = inputs.get("incumbent_path")
+    if not inc_path and inputs.get("incumbent_version_id") != "V0":
+        raise ValueError(f"ABBA incumbent path missing for {inputs.get('incumbent_version_id')}")
     inc_fn = (
         _load_python_entrypoint(Path(inc_path), "abba_inc").run
         if inc_path

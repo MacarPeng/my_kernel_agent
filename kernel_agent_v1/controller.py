@@ -648,6 +648,8 @@ class Controller:
         if verdict == "needs_retest":
             v.retest_required = True
             v.retest_status = "scheduled"
+            incumbent_version_id = x.get("expected_incumbent_id", "V0")
+            incumbent_artifact_id = x.get("expected_incumbent_artifact_id", "fla-baseline")
             abba_tid = self._next_task_id(f"abba-{v.version_id}")
             self.tasks[abba_tid] = TaskSpec(
                 task_id=abba_tid,
@@ -656,14 +658,16 @@ class Controller:
                 direction_id=v.direction_id,
                 version_id=v.version_id,
                 artifact_id=v.artifact_id,
+                package_id=self._benchmark_package_id(v.version_id, v.artifact_id),
                 is_required=True,
                 priority=v.priority + 100.0,
                 reply_to="judge",
                 ready_at=event.sim_time,
                 metadata={
-                    "incumbent_version_id": x.get("expected_incumbent_id", "V0"),
-                    "incumbent_artifact_id": x.get(
-                        "expected_incumbent_artifact_id", "fla-baseline"
+                    "incumbent_version_id": incumbent_version_id,
+                    "incumbent_artifact_id": incumbent_artifact_id,
+                    "incumbent_package_id": self._benchmark_package_id(
+                        incumbent_version_id, incumbent_artifact_id
                     ),
                     "incumbent_speedup": x.get("incumbent_speedup", 1.0),
                     "speedup": x.get("candidate_speedup", 1.05),
@@ -916,6 +920,19 @@ class Controller:
         self.flush_snapshot()
         return v
 
+    def _benchmark_package_id(self, version_id: str, artifact_id: str) -> str | None:
+        return next(
+            (
+                task.package_id
+                for task in self.tasks.values()
+                if task.kind == JobKind.BENCHMARK_BLOCK.value
+                and task.version_id == version_id
+                and task.artifact_id == artifact_id
+                and task.package_id
+            ),
+            None,
+        )
+
     def schedule_final_eval(self) -> list[TaskSpec]:
         """Register the 3 independent final eval GPU blocks for the retained incumbent (§7)."""
         if (
@@ -926,6 +943,9 @@ class Controller:
             return []
         self.final_eval_requested = True
         self.final_eval_version_id = self.global_best_version_id
+        package_id = self._benchmark_package_id(
+            self.global_best_version_id, self.global_best_artifact_id
+        )
         now = self.clock.now()
         created: list[TaskSpec] = []
         for fb in FINAL_BLOCK_IDS:
@@ -937,6 +957,7 @@ class Controller:
                 direction_id="final_eval",
                 version_id=self.global_best_version_id,
                 artifact_id=self.global_best_artifact_id,
+                package_id=package_id,
                 block_id=fb,
                 is_required=True,
                 priority=1000.0,

@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+from contextlib import redirect_stderr, redirect_stdout
+from io import StringIO
+import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from kernel_agent_v1.cli import main as cli_main
 from kernel_agent_v1.clock import SimClock
@@ -18,7 +22,9 @@ from kernel_agent_v1.gdn_task import (
     validate_gdn_candidate_sources,
 )
 from kernel_agent_v1.leader import Leader
+from kernel_agent_v1.llm import ScriptedDeepSeekClient
 from kernel_agent_v1.protocol import CommandKind, EventType, TargetRef
+from kernel_agent_v1.store import RunStore
 from kernel_agent_v1.wiki import HardwareKnowledgePlugin, KernelWiki
 
 
@@ -102,6 +108,28 @@ class TestGdnAdaptation(unittest.TestCase):
                 ]
             )
             self.assertEqual(rc, 0)
+
+    def test_invalid_model_replies_allow_seed_evaluation_to_finish(self) -> None:
+        plan = {"allowed_paths": ["kernel.py"], "preserve_target": False}
+        for replies, message in (
+            (["   ", "not JSON"], "[model-error] stage=researcher"),
+            ([plan, "null", "{"], "[coder-blocked]"),
+        ):
+            with self.subTest(message=message), tempfile.TemporaryDirectory() as tmp:
+                pending_replies = iter(replies)
+                client = ScriptedDeepSeekClient(lambda messages: next(pending_replies))
+                stdout, stderr = StringIO(), StringIO()
+                with patch("kernel_agent_v1.cli.DeepSeekClient", return_value=client), \
+                     redirect_stdout(stdout), redirect_stderr(stderr):
+                    rc = cli_main(["run", "--deepseek-live", "--run-dir", tmp])
+                self.assertEqual(rc, 0)
+                self.assertIn(message, stderr.getvalue())
+                self.assertEqual(len(client.calls), len(replies))
+                metrics = json.loads(stdout.getvalue())
+                self.assertEqual(metrics["versions_closed"], 1)
+                self.assertEqual(metrics["stop_reason"], "completed")
+                ledger = RunStore(tmp).load_snapshot()["ledger"]
+                self.assertAlmostEqual(ledger["model_cost_used"], 0.0005 * len(replies))
 
 
 if __name__ == "__main__":

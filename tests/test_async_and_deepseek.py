@@ -10,7 +10,6 @@ import unittest
 
 from kernel_agent_v1.async_runtime import AsyncKernelLabRunner, AsyncRunnerHooks
 from kernel_agent_v1.backends import (
-    LocalSubprocessBackend,
     RealSingleGpuBackend,
     parse_ncu_csv,
 )
@@ -155,7 +154,13 @@ class TestAsyncAndDeepSeek(unittest.TestCase):
                 total_cases=100,
                 num_blocks=4,
             )
-            backend = LocalSubprocessBackend()
+            backend = RealSingleGpuBackend(
+                enable_gpu_probe=False,
+                eval_cmd_template=[
+                    sys.executable, "{package_dir}/{entrypoint}",
+                    "--inputs", "inputs.json", "--output", "output.json",
+                ],
+            )
             rt = KernelLabRuntime(Path(tmp), config=cfg, clock=clock, backend=backend)
             rt.register_route("reg", "register spill", priority=2.0, researcher_id="res_reg")
 
@@ -168,8 +173,9 @@ class TestAsyncAndDeepSeek(unittest.TestCase):
             )
             fast_worker_v2 = _subprocess_worker_script(evaluator, speedup=1.26)
 
-            res_llm = ScriptedDeepSeekClient(
-                lambda msgs: {
+            research_replies = iter([
+                "   ",
+                {
                     "observation": "W1 shows gain, propose v2",
                     "explanation": "Further unroll cut",
                     "prediction": "1.26x",
@@ -179,8 +185,8 @@ class TestAsyncAndDeepSeek(unittest.TestCase):
                     "deliverable": "kernel/run_kernel.py",
                     "allowed_paths": ["kernel/"],
                 },
-                latency_s=0.02,
-            )
+            ])
+            res_llm = ScriptedDeepSeekClient(lambda msgs: next(research_replies), latency_s=0.02)
             coder_llm = ScriptedDeepSeekClient(
                 lambda msgs: {
                     "artifact_id": "art-v2",
@@ -238,25 +244,6 @@ class TestAsyncAndDeepSeek(unittest.TestCase):
                         runtime.packages_by_id[pkg2.manifest.package_id] = pkg2
                     await runner.submit_external_event(evt2)
 
-            # Override ABBA and Final Eval commands cleanly via LocalSubprocessBackend wrapper
-            orig_start = backend.start
-
-            def _patched_start(job_id, attempt_id, task_id, kind, resource, package, inputs, clock):
-                enriched = dict(inputs)
-                if package is None and kind in ("abba_retest", "final_eval"):
-                    enriched["command"] = [
-                        sys.executable,
-                        "-c",
-                        _subprocess_worker_script(evaluator, speedup=1.26),
-                        "--inputs",
-                        "inputs.json",
-                        "--output",
-                        "output.json",
-                    ]
-                return orig_start(job_id, attempt_id, task_id, kind, resource, package, enriched, clock)
-
-            backend.start = _patched_start  # type: ignore[method-assign]
-
             runner = AsyncKernelLabRunner(
                 rt,
                 hooks=AsyncRunnerHooks(on_research_evidence=_on_evidence),
@@ -267,7 +254,18 @@ class TestAsyncAndDeepSeek(unittest.TestCase):
             self.assertEqual(metrics.best_artifact_id, "art-v2")
             self.assertEqual(metrics.verification_level, VerificationLevel.FINAL_VERIFIED.value)
             self.assertGreater(metrics.member_gpu_overlap_s, 0.0)
-            self.assertGreater(metrics.model_cost_used, 0.0)
+            self.assertEqual(len(res_llm.calls), 2)
+            self.assertAlmostEqual(metrics.model_cost_used, 0.0015)
+
+            packages = {p.manifest.artifact_id: p.manifest.package_id for p in rt.packages_by_id.values()}
+            abba = next(t for t in rt.controller.tasks.values() if t.kind == "abba_retest")
+            self.assertEqual(abba.package_id, packages["art-v2"])
+            self.assertEqual(abba.metadata["incumbent_package_id"], packages["art-v1"])
+            for _, event in rt.store.load_events():
+                if event.kind == "benchmark_block" and event.event == EventType.GPU_JOB_FINISHED.value:
+                    evidence = rt.store.read_evidence(event.receipt_id)
+                    self.assertTrue(evidence["valid"], evidence["issues"])
+                    self.assertEqual({row["attempt_id"] for row in evidence["cases"]}, {event.attempt_id})
 
     def test_ncu_csv_parser_and_real_single_gpu_backend_cleanup_probe(self) -> None:
         csv_sample = (

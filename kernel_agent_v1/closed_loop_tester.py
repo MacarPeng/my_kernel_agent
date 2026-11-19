@@ -209,7 +209,6 @@ class _SubprocessAwareOperatorBackend(LocalSubprocessBackend):
 
     def start(self, job_id, attempt_id, task_id, kind, resource, package, inputs, clock):
         enriched = dict(inputs)
-        enriched["attempt_id"] = attempt_id
         if kind == JobKind.NCU_PARSE.value:
             # Run CPU NCU parse inline via python -c
             code = (

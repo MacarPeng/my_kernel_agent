@@ -21,6 +21,7 @@ from kernel_agent_v1.llm import (
     DeepSeekCoderAdapter,
     DeepSeekConfig,
     DeepSeekResearcherAdapter,
+    LLMResponseFormatError,
 )
 from kernel_agent_v1.protocol import (
     BudgetConfig,
@@ -47,6 +48,7 @@ def _run_end_to_end(args: argparse.Namespace) -> int:
     evaluator = TrustedEvaluator.from_official_gdn_dataset(
         device_id=f"{cfg.gpu_name}:0",
         min_gain_threshold=cfg.min_gain_threshold,
+        use_measured_baselines=args.backend == "real-gpu",
     )
     if args.backend == "real-gpu":
         clock = RealClock()
@@ -116,10 +118,6 @@ def _run_end_to_end(args: argparse.Namespace) -> int:
         print(f"Failed to package seed candidate: {seed_evt.to_dict()}", file=sys.stderr)
         return 2
 
-    artifact_entrypoints: dict[str, str] = {
-        "art-seed-v0": str(Path(seed_pkg.root_dir) / seed_pkg.manifest.entrypoint)
-    }
-
     # Inject candidate_path (and incumbent_path for ABBA) into RealSingleGpuBackend inputs
     if args.backend == "real-gpu":
         orig_dispatch = rt.dispatch_gpu_if_ready
@@ -129,12 +127,12 @@ def _run_end_to_end(args: argparse.Namespace) -> int:
                 extra = extra_inputs_fn(task) if extra_inputs_fn else {}
                 pkg = rt.packages_by_id.get(task.package_id) if task.package_id else None
                 if pkg is not None:
-                    extra["candidate_path"] = str(Path(pkg.root_dir) / pkg.manifest.entrypoint)
-                elif task.artifact_id and task.artifact_id in artifact_entrypoints:
-                    extra["candidate_path"] = artifact_entrypoints[task.artifact_id]
-                inc_art = task.metadata.get("incumbent_artifact_id")
-                if inc_art and inc_art in artifact_entrypoints:
-                    extra["incumbent_path"] = artifact_entrypoints[inc_art]
+                    candidate_path = Path(pkg.root_dir) / pkg.manifest.entrypoint
+                    extra["candidate_path"] = str(candidate_path.resolve())
+                inc_pkg = rt.packages_by_id.get(task.metadata.get("incumbent_package_id"))
+                if inc_pkg is not None:
+                    incumbent_path = Path(inc_pkg.root_dir) / inc_pkg.manifest.entrypoint
+                    extra["incumbent_path"] = str(incumbent_path.resolve())
                 extra["device_id"] = evaluator.device_id
                 if args.smoke_cases > 0:
                     extra["max_cases"] = args.smoke_cases
@@ -166,21 +164,32 @@ def _run_end_to_end(args: argparse.Namespace) -> int:
         if delivery.block_id and delivery.block_id != "W1":
             return
         rounds_remaining[0] -= 1
-        cmd, _, u1 = await res_adapter.plan_from_evidence(
-            researcher_id="res_main",
-            direction_id="gdn-prefill-main",
-            deliveries=[delivery],
-            default_target=TargetRef(
-                delivery.version_id or "V1", delivery.artifact_id or "art-seed-v0"
-            ),
-        )
-        evt, pkg, u2 = await coder_adapter.implement(cmd)
-        runtime.controller.ledger.model_cost_used += u1.cost_usd + u2.cost_usd
+        try:
+            cmd, _, usage = await res_adapter.plan_from_evidence(
+                researcher_id="res_main",
+                direction_id="gdn-prefill-main",
+                deliveries=[delivery],
+                default_target=TargetRef(
+                    delivery.version_id or "V1", delivery.artifact_id or "art-seed-v0"
+                ),
+            )
+        except LLMResponseFormatError as exc:
+            runtime.controller.ledger.model_cost_used += exc.usage.cost_usd
+            print(
+                f"[model-error] stage=researcher version={delivery.version_id} "
+                f"receipt={delivery.receipt_id} error={exc}",
+                file=sys.stderr,
+            )
+            return
+        runtime.controller.ledger.model_cost_used += usage.cost_usd
+        try:
+            evt, pkg, usage = await coder_adapter.implement(cmd)
+        except LLMResponseFormatError as exc:
+            usage = exc.usage
+            evt, pkg = runtime.coder.execute_command(cmd, {"blocked_reason": str(exc)})
+        runtime.controller.ledger.model_cost_used += usage.cost_usd
         if pkg is not None:
             runtime.packages_by_id[pkg.manifest.package_id] = pkg
-            artifact_entrypoints[pkg.manifest.artifact_id] = str(
-                Path(pkg.root_dir) / pkg.manifest.entrypoint
-            )
         else:
             print(
                 f"[coder-blocked] cmd={cmd.head.command_id} details={evt.extra}",

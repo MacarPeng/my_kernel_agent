@@ -113,6 +113,7 @@ class TrustedEvaluator:
         min_gain_threshold: float = 0.01,
         uuids: tuple[str, ...] | None = None,
         blocks: dict[str, tuple[str, ...]] | None = None,
+        use_measured_baselines: bool = False,
     ) -> None:
         self.protocol = protocol
         self.device_id = device_id
@@ -122,7 +123,8 @@ class TrustedEvaluator:
             blocks if blocks is not None else partition_blocks(self.uuids, num_blocks)
         )
         self.min_gain_threshold = min_gain_threshold
-        # Frozen FLA baseline latencies (ms) deterministic per UUID
+        self.use_measured_baselines = use_measured_baselines
+        # Deterministic baseline latencies for simulations and offline fixtures.
         self.frozen_baseline_ms: dict[str, float] = {
             uuid: 1.0 + (idx % 17) * 0.12 for idx, uuid in enumerate(self.uuids)
         }
@@ -132,6 +134,7 @@ class TrustedEvaluator:
         cls,
         device_id: str = "NVIDIA-L4:0",
         min_gain_threshold: float = 0.01,
+        use_measured_baselines: bool = False,
     ) -> "TrustedEvaluator":
         """Construct TrustedEvaluator pinned to the 100 official GDN UUIDs & stratified W1..W4."""
         from kernel_agent_v1.gdn_task import (
@@ -150,7 +153,28 @@ class TrustedEvaluator:
             min_gain_threshold=min_gain_threshold,
             uuids=uuids,
             blocks=blocks,
+            use_measured_baselines=use_measured_baselines,
         )
+
+    def _case_latencies(
+        self, uuid: str, row: dict[str, Any], issues: list[str]
+    ) -> tuple[float, float]:
+        baseline = row.get("baseline_ms")
+        if not self.use_measured_baselines:
+            baseline = self.frozen_baseline_ms.get(uuid, row.get("baseline_ms", 1.0))
+        latencies = []
+        for field_name, value in (
+            ("candidate_ms", row.get("candidate_ms")), ("baseline_ms", baseline)
+        ):
+            try:
+                latency = float(value)
+            except (TypeError, ValueError, OverflowError):
+                latency = 0.0
+            if not math.isfinite(latency) or latency <= 0:
+                issues.append(f"invalid {field_name} on {uuid}: expected a positive, finite latency")
+                latency = 0.0
+            latencies.append(latency)
+        return latencies[0], latencies[1]
 
     def verify_block(
         self,
@@ -189,13 +213,8 @@ class TrustedEvaluator:
             if att != expected_attempt_id:
                 issues.append(f"attempt mismatch on {uuid}: {att} != {expected_attempt_id}")
 
-            baseline_ms = self.frozen_baseline_ms.get(
-                uuid, float(row.get("baseline_ms", 1.0))
-            )
-            cand_ms = float(row["candidate_ms"])
+            cand_ms, baseline_ms = self._case_latencies(uuid, row, issues)
             correct = bool(row["correct"])
-            if cand_ms <= 0:
-                issues.append(f"non-positive candidate_ms on {uuid}: {cand_ms}")
 
             parsed.append(
                 CaseMeasurement(
@@ -283,6 +302,7 @@ class TrustedEvaluator:
                 )
 
             raw_cases = payload.get("cases", [])
+            block_attempt_id = payload.get("attempt_id", "")
             for row in raw_cases:
                 uuid = str(row["uuid"])
                 if uuid in seen_uuids:
@@ -293,18 +313,16 @@ class TrustedEvaluator:
                 row_ver = str(row.get("version_id", payload.get("version_id", "")))
                 row_proto = str(row.get("protocol", payload.get("protocol", "")))
                 row_dev = str(row.get("device_id", payload.get("device_id", "")))
+                row_attempt_id = str(row.get("attempt_id", block_attempt_id))
                 if row_art != expected_artifact_id or row_ver != expected_version_id:
                     issues.append(f"mixed source on {uuid} in {block_id}")
                 if row_proto != self.protocol or row_dev != self.device_id:
                     issues.append(f"mixed env/protocol on {uuid} in {block_id}")
+                if block_attempt_id and row_attempt_id != block_attempt_id:
+                    issues.append(f"attempt mismatch on {uuid}: {row_attempt_id} != {block_attempt_id}")
 
-                baseline_ms = self.frozen_baseline_ms.get(
-                    uuid, float(row.get("baseline_ms", 1.0))
-                )
-                cand_ms = float(row["candidate_ms"])
+                cand_ms, baseline_ms = self._case_latencies(uuid, row, issues)
                 correct = bool(row["correct"])
-                if cand_ms <= 0:
-                    issues.append(f"invalid timing on {uuid}: {cand_ms}")
                 all_cases.append(
                     CaseMeasurement(
                         uuid=uuid,
@@ -316,7 +334,7 @@ class TrustedEvaluator:
                         version_id=row_ver,
                         protocol=row_proto,
                         device_id=row_dev,
-                        attempt_id=str(row.get("attempt_id", payload.get("attempt_id", ""))),
+                        attempt_id=row_attempt_id,
                     )
                 )
 

@@ -430,11 +430,14 @@ class LocalSubprocessBackend(ExecutionBackend):
         workdir = tempfile.mkdtemp(prefix=f"kernellab-{job_id}-")
         input_path = Path(workdir) / "inputs.json"
         output_path = Path(workdir) / "output.json"
-        input_path.write_text(json.dumps(inputs, ensure_ascii=False), encoding="utf-8")
+        input_path.write_text(
+            json.dumps({**inputs, "attempt_id": attempt_id}, ensure_ascii=False),
+            encoding="utf-8",
+        )
 
         cmd = inputs.get("command")
         if package is not None:
-            entry = Path(package.root_dir) / package.manifest.entrypoint
+            entry = (Path(package.root_dir) / package.manifest.entrypoint).resolve()
             if cmd is None:
                 cmd = [
                     sys.executable,

@@ -52,6 +52,24 @@ def _make_block_payload(
 
 
 class TestEvaluatorAndJudge(unittest.TestCase):
+    def test_measured_baseline_is_used_for_block_and_complete_scores(self) -> None:
+        ev = TrustedEvaluator(total_cases=4, use_measured_baselines=True)
+        blocks = {b: _make_block_payload(ev, b, "V1", "art-1", 1.0) for b in ev.blocks}
+        for payload in blocks.values():
+            for row in payload["cases"]:
+                row.update(baseline_ms=0.6, candidate_ms=0.2)
+
+        block = ev.verify_block("W1", blocks["W1"]["cases"], "V1", "art-1", "job-W1/1")
+        self.assertTrue(block.valid)
+        self.assertAlmostEqual(block.geomean_speedup, 3.0)
+        complete = ev.aggregate_complete(blocks, "V1", "art-1")
+        self.assertTrue(complete.valid)
+        self.assertAlmostEqual(complete.geomean_speedup, 3.0)
+
+        blocks["W1"]["cases"][0].pop("baseline_ms")
+        self.assertFalse(ev.verify_block("W1", blocks["W1"]["cases"], "V1", "art-1", "job-W1/1").valid)
+        self.assertFalse(ev.aggregate_complete(blocks, "V1", "art-1").valid)
+
     def test_missing_duplicate_and_mixed_source_rejected(self) -> None:
         ev = TrustedEvaluator()
         # Missing UUID
@@ -79,6 +97,12 @@ class TestEvaluatorAndJudge(unittest.TestCase):
         }
         res_mix = ev.aggregate_complete(blocks_mix, "V1", "art-1")
         self.assertFalse(res_mix.valid)
+
+        blocks_retry = {b: _make_block_payload(ev, b, "V1", "art-1", 1.2) for b in ev.blocks}
+        blocks_retry["W2"]["attempt_id"] = "job-W2/2"
+        res_retry = ev.aggregate_complete(blocks_retry, "V1", "art-1")
+        self.assertFalse(res_retry.valid)
+        self.assertTrue(any("attempt mismatch" in issue for issue in res_retry.issues))
 
     def test_first_retention_abba_and_final_eval_three_blocks(self) -> None:
         ev = TrustedEvaluator(min_gain_threshold=0.01)
