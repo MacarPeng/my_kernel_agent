@@ -245,9 +245,12 @@ class ScriptedDeepSeekClient(LLMClient):
 class DeepSeekResearcherAdapter:
     """Translates EvidenceDelivery + Wiki lookup into validated Leader/Researcher commands."""
 
-    def __init__(self, llm: LLMClient, leader: Leader) -> None:
+    def __init__(
+        self, llm: LLMClient, leader: Leader, *, task_definition: dict[str, Any] | None = None
+    ) -> None:
         self.llm = llm
         self.leader = leader
+        self.task_definition = task_definition
 
     async def plan_from_evidence(
         self,
@@ -272,14 +275,13 @@ class DeepSeekResearcherAdapter:
         )
 
         sys_prompt = (
-            "You are a KernelLab Researcher optimizing GDN prefill Triton/PyTorch kernels. "
+            "You are a KernelLab Researcher optimizing kernels. "
             "Separate observation, explanation, prediction, and emit valid JSON with keys: "
             "observation, explanation, prediction, hypothesis, command_kind "
             "(one of implement_kernel, write_ncu_capture, write_probe, write_compiler_analysis), "
             "instruction, deliverable, allowed_paths (use ['kernel.py'] for implement_kernel), "
             "workload_ids, preserve_target (false for implement_kernel). "
-            "For implement_kernel, kernel.py MUST define "
-            "run(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale) -> (output, new_state). "
+            "When provided, task_definition specifies the required kernel interface and semantics. "
             'Example JSON: {"observation":"W1 long cases are slow","explanation":"launch overhead",'
             '"prediction":"fewer launches reduce latency","hypothesis":"fuse the gating step",'
             '"command_kind":"implement_kernel","instruction":"fuse gating and update",'
@@ -305,6 +307,8 @@ class DeepSeekResearcherAdapter:
                 "artifact_id": default_target.artifact_id,
             },
         }
+        if self.task_definition is not None:
+            user_payload["task_definition"] = self.task_definition
         parsed, usage = await _complete_json(
             self.llm,
             [
@@ -361,9 +365,12 @@ class DeepSeekResearcherAdapter:
 class DeepSeekCoderAdapter:
     """Translates Leader Command into constraint-checked immutable CodePackage via DeepSeek."""
 
-    def __init__(self, llm: LLMClient, coder: Coder) -> None:
+    def __init__(
+        self, llm: LLMClient, coder: Coder, *, task_definition: dict[str, Any] | None = None
+    ) -> None:
         self.llm = llm
         self.coder = coder
+        self.task_definition = task_definition
 
     async def implement(
         self, command: Command
@@ -373,16 +380,19 @@ class DeepSeekCoderAdapter:
             "('kernel.py' for implement_kernel), files (dict of rel_path -> complete Python code), "
             "executable_stages. Strictly stay inside allowed_paths. Only import from "
             "triton, torch, math, typing, functools (no os/sys/eval/open). For implement_kernel, "
-            "kernel.py MUST define run(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale) "
-            "returning (output_bf16, new_state_fp32). "
-            'Example JSON shape: {"artifact_id":"gdn-fused","entrypoint":"kernel.py",'
+            "follow task_definition when provided, including the Python callable, tensor shapes, "
+            "dtypes, layouts and implementation rules. Use inputs and outputs in listed order. "
+            'Example JSON shape: {"artifact_id":"optimized-kernel","entrypoint":"kernel.py",'
             '"files":{"kernel.py":"<complete implementation>"}}'
         )
+        user_payload = command.to_dict()
+        if self.task_definition is not None:
+            user_payload["task_definition"] = self.task_definition
         parsed, usage = await _complete_json(
             self.llm,
             [
                 LLMMessage("system", sys_prompt),
-                LLMMessage("user", json.dumps(command.to_dict(), ensure_ascii=False)),
+                LLMMessage("user", json.dumps(user_payload, ensure_ascii=False)),
             ],
         )
         evt, pkg = self.coder.execute_command(command, provided_spec=parsed)

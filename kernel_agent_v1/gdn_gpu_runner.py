@@ -39,12 +39,18 @@ def _build_reference_fn(defn: dict[str, Any]):
     return ns["run"]
 
 
-def _make_deterministic_gdn_inputs(row: dict[str, Any], torch_mod, device: str):
+def _make_deterministic_gdn_inputs(
+    row: dict[str, Any], torch_mod, device: str, definition: dict[str, Any] | None = None
+):
     """Synthesize deterministic GDN inputs matching the official workload axes."""
     axes = row["axes"]
     total_seq_len = int(axes["total_seq_len"])
     num_seqs = int(axes["num_seqs"])
-    hq, hk, hv, d = 4, 4, 8, 128
+    task_axes = (definition if definition is not None else load_official_definition())["axes"]
+    hq, hk, hv, d = (
+        task_axes[name]["value"]
+        for name in ("num_q_heads", "num_k_heads", "num_v_heads", "head_size")
+    )
 
     seed = int(row["uuid"].replace("-", "")[:8], 16) % (2**31 - 1)
     gen = torch_mod.Generator(device="cpu")
@@ -110,6 +116,8 @@ def _time_cuda_fn(fn, args, torch_mod, warmup: int = 1, iters: int = 3) -> float
 def _check_correctness(cand_out, ref_out, torch_mod) -> bool:
     c_o, c_s = cand_out
     r_o, r_s = ref_out
+    if c_o.shape != r_o.shape or c_s.shape != r_s.shape:
+        return False
     ok_o = bool(torch_mod.allclose(c_o.float(), r_o.float(), atol=2e-2, rtol=2e-2))
     ok_s = bool(torch_mod.allclose(c_s.float(), r_s.float(), atol=2e-2, rtol=2e-2))
     return ok_o and ok_s
@@ -141,7 +149,7 @@ def _run_benchmark_block(inputs: dict[str, Any], torch_mod) -> dict[str, Any]:
     cases: list[dict[str, Any]] = []
     for uid in eval_uuids:
         row = by_uuid[uid]
-        args = _make_deterministic_gdn_inputs(row, torch_mod, device)
+        args = _make_deterministic_gdn_inputs(row, torch_mod, device, defn)
         if torch_mod.cuda.is_available():
             # Time reference in a single pass to halve pure-Python reference overhead
             torch_mod.cuda.synchronize()
@@ -249,7 +257,7 @@ def _run_abba_retest(inputs: dict[str, Any], torch_mod) -> dict[str, Any]:
 
     paired_cases: list[dict[str, Any]] = []
     for row in rows:
-        args = _make_deterministic_gdn_inputs(row, torch_mod, device)
+        args = _make_deterministic_gdn_inputs(row, torch_mod, device, defn)
         ref_out = ref_fn(*args)
         cand_out = cand_fn(*args)
         correct = _check_correctness(cand_out, ref_out, torch_mod)
@@ -294,7 +302,7 @@ def _run_final_eval(inputs: dict[str, Any], torch_mod) -> dict[str, Any]:
     cases: list[dict[str, Any]] = []
     ratios: list[float] = []
     for row in rows:
-        args = _make_deterministic_gdn_inputs(row, torch_mod, device)
+        args = _make_deterministic_gdn_inputs(row, torch_mod, device, defn)
         ref_out = ref_fn(*args)
         cand_out = cand_fn(*args)
         correct = _check_correctness(cand_out, ref_out, torch_mod)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from pathlib import Path
 import sys
 import tempfile
@@ -93,7 +94,14 @@ class TestAsyncAndDeepSeek(unittest.TestCase):
                     "workload_ids": [],
                 }
             )
-            res_adapter = DeepSeekResearcherAdapter(res_llm, rt.leader)
+            task = {
+                "name": "test_matmul",
+                "entrypoint": "matmul",
+                "inputs": {"a": {"shape": ["M", "K"]}, "b": {"shape": ["K", "N"]}},
+                "outputs": {"c": {"shape": ["M", "N"]}},
+                "implementation_rules": ["Reduce over K."],
+            }
+            res_adapter = DeepSeekResearcherAdapter(res_llm, rt.leader, task_definition=task)
             cmd, _, usage = asyncio.run(
                 res_adapter.plan_from_evidence(
                     researcher_id="res_reg",
@@ -139,10 +147,14 @@ class TestAsyncAndDeepSeek(unittest.TestCase):
                 }
             )
             evt_ok, pkg_ok, _ = asyncio.run(
-                DeepSeekCoderAdapter(ok_coder_llm, rt.coder).implement(cmd)
+                DeepSeekCoderAdapter(ok_coder_llm, rt.coder, task_definition=task).implement(cmd)
             )
             self.assertEqual(evt_ok.event, EventType.CODE_READY.value)
             self.assertIsNotNone(pkg_ok)
+            for client in (res_llm, ok_coder_llm):
+                system, user = client.calls[0]
+                self.assertEqual(json.loads(user.content)["task_definition"], task)
+                self.assertNotIn("GDN", system.content)
 
     def test_async_concurrent_runner_with_real_subprocesses_and_deepseek_adapters(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

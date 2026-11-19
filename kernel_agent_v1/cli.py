@@ -16,7 +16,7 @@ from kernel_agent_v1.clock import RealClock, SimClock
 from kernel_agent_v1.closed_loop_tester import ClosedLoopTester
 from kernel_agent_v1.evaluator import FINAL_BLOCK_IDS, TrustedEvaluator
 from kernel_agent_v1.experiments import format_comparison_report, run_three_way_comparison
-from kernel_agent_v1.gdn_task import seed_gdn_candidate_source
+from kernel_agent_v1.gdn_task import load_official_definition, seed_gdn_candidate_source
 from kernel_agent_v1.llm import (
     DeepSeekClient,
     DeepSeekCoderAdapter,
@@ -168,8 +168,9 @@ def _run_end_to_end(args: argparse.Namespace) -> int:
             live_enabled=bool(args.deepseek_live),
         )
     )
-    res_adapter = DeepSeekResearcherAdapter(llm_client, rt.leader)
-    coder_adapter = DeepSeekCoderAdapter(llm_client, rt.coder)
+    task_definition = load_official_definition()
+    res_adapter = DeepSeekResearcherAdapter(llm_client, rt.leader, task_definition=task_definition)
+    coder_adapter = DeepSeekCoderAdapter(llm_client, rt.coder, task_definition=task_definition)
 
     async def _on_evidence(runtime: KernelLabRuntime, delivery: EvidenceDelivery) -> None:
         if not args.deepseek_live or rounds_remaining[0] <= 0:

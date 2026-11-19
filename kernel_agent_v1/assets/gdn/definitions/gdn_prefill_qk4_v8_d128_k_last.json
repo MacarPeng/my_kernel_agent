@@ -39,6 +39,12 @@
       "description": "Length of cu_seqlens array (num_seqs + 1)."
     }
   },
+  "entrypoint": "run",
+  "implementation_rules": [
+    "Compute every V head independently and use num_v_heads for output allocation and head dispatch.",
+    "For V head h, read Q head h // (num_v_heads // num_q_heads) and K head h // (num_v_heads // num_k_heads), matching the reference repeat_interleave.",
+    "Index V, gating tensors, recurrent state and output by V head h. Preserve the k-last state layout [N, H, V, K]."
+  ],
   "constraints": [
     "len_cu_seqlens == num_seqs + 1",
     "total_seq_len == cu_seqlens[-1].item()"
