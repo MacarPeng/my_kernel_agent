@@ -440,17 +440,17 @@ class EvidenceDelivery:
 class BudgetConfig:
     """Frozen run and per-version budgets (§7)."""
 
-    total_wall_budget_s: float = 3600.0
-    total_gpu_budget_s: float = 1800.0
+    total_wall_budget_s: float = 36000.0
+    total_gpu_budget_s: float = 18000.0
     total_model_budget_cost: float = 100.0
-    version_diag_budget_s: float = 120.0
-    version_deadline_s: float = 600.0
-    judge_decision_timeout_s: float = 30.0
+    version_diag_budget_s: float = 1200.0
+    version_deadline_s: float = 6000.0
+    judge_decision_timeout_s: float = 300.0
     reserve_required_block_s: float = 60.0
-    reserve_retest_s: float = 90.0
-    reserve_final_eval_s: float = 180.0
-    first_trial_diag_timeout_s: float = 45.0
-    default_job_timeout_s: float = 180.0
+    reserve_retest_s: float = 900.0
+    reserve_final_eval_s: float = 1800.0
+    first_trial_diag_timeout_s: float = 450.0
+    default_job_timeout_s: float = 1800.0
     max_compile_correctness_repairs: int = 2
     max_infra_retries: int = 1
     final_eval_job_timeout_s: float | None = None

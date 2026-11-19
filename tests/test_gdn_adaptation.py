@@ -122,7 +122,7 @@ class TestGdnAdaptation(unittest.TestCase):
             self.assertEqual(rc, 0)
 
     def test_real_gpu_cli_reserves_time_for_three_long_final_blocks(self) -> None:
-        for timeout_override, final_timeout in ((None, 3600), (3000, 3000), (2000, 2000)):
+        for timeout_override, final_timeout in ((None, 36_000), (3000, 3000), (2000, 2000)):
             with self.subTest(final_timeout=final_timeout), tempfile.TemporaryDirectory() as tmp:
                 evaluator = TrustedEvaluator.from_official_gdn_dataset()
                 backend = TimedBackend(evaluator)
@@ -149,7 +149,7 @@ class TestGdnAdaptation(unittest.TestCase):
                 tasks = RunStore(tmp).load_snapshot()["tasks"].values()
                 blocks = {t["block_id"]: t["timeout_s"] for t in tasks if t["kind"] == "final_eval"}
                 self.assertEqual(blocks, {"F1": final_timeout, "F2": final_timeout, "F3": final_timeout})
-                self.assertEqual({t["timeout_s"] for t in tasks if t["kind"] == "benchmark_block"}, {180.0})
+                self.assertEqual({t["timeout_s"] for t in tasks if t["kind"] == "benchmark_block"}, {1800.0})
 
     def test_real_gpu_cli_allows_long_abba_before_final_evaluation(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -177,7 +177,7 @@ class TestGdnAdaptation(unittest.TestCase):
             self.assertEqual(result["verification_level"], "final_verified")
             tasks = RunStore(tmp).load_snapshot()["tasks"].values()
             self.assertEqual(
-                [t["timeout_s"] for t in tasks if t["kind"] == "abba_retest"], [1800.0]
+                [t["timeout_s"] for t in tasks if t["kind"] == "abba_retest"], [18_000.0]
             )
 
     def test_dual_researcher_uses_diagnosis_available_before_command(self) -> None:

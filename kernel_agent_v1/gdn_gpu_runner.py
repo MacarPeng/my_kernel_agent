@@ -22,6 +22,7 @@ from kernel_agent_v1.gdn_task import (
     load_official_workloads,
     stratified_split_workblocks,
 )
+from kernel_agent_v1.protocol import BudgetConfig
 
 
 def _load_python_entrypoint(py_path: Path, module_name: str = "candidate_kernel"):
@@ -261,7 +262,8 @@ def _run_ncu_capture(inputs: dict[str, Any]) -> dict[str, Any]:
         "-c",
         probe_code,
     ]
-    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=180, check=False)
+    timeout_s = float(inputs.get("timeout_s", BudgetConfig.default_job_timeout_s))
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_s, check=False)
     if proc.returncode != 0:
         return {
             "raw_ncu_report": {

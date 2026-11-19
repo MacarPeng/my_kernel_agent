@@ -18,7 +18,7 @@ from typing import Any
 
 from kernel_agent_v1.clock import Clock
 from kernel_agent_v1.evaluator import TrustedEvaluator
-from kernel_agent_v1.protocol import CodePackage, JobKind
+from kernel_agent_v1.protocol import BudgetConfig, CodePackage, JobKind
 
 
 @dataclass
@@ -161,7 +161,7 @@ class SimulatedExecutionBackend(ExecutionBackend):
         duration_s = float(
             beh.get("duration_s", inputs.get("duration_s", 20.0))
         )
-        timeout_s = float(inputs.get("timeout_s", 180.0))
+        timeout_s = float(inputs.get("timeout_s", BudgetConfig.default_job_timeout_s))
 
         return JobHandle(
             job_id=job_id,
@@ -426,7 +426,7 @@ class LocalSubprocessBackend(ExecutionBackend):
         clock: Clock,
     ) -> JobHandle:
         now = clock.now()
-        timeout_s = float(inputs.get("timeout_s", 180.0))
+        timeout_s = float(inputs.get("timeout_s", BudgetConfig.default_job_timeout_s))
         workdir = tempfile.mkdtemp(prefix=f"kernellab-{job_id}-")
         input_path = Path(workdir) / "inputs.json"
         output_path = Path(workdir) / "output.json"
@@ -501,7 +501,7 @@ class LocalSubprocessBackend(ExecutionBackend):
                 duration_s=0.0,
                 error="missing process handle",
             )
-        timeout_s = float(handle.metadata.get("timeout_s", 180.0))
+        timeout_s = float(handle.metadata.get("timeout_s", BudgetConfig.default_job_timeout_s))
         try:
             stdout_b, stderr_b = proc.communicate(timeout=timeout_s)
         except subprocess.TimeoutExpired:
@@ -573,11 +573,11 @@ class LocalSubprocessBackend(ExecutionBackend):
         pgid = handle.pgid or proc.pid
         try:
             os.killpg(pgid, signal.SIGTERM)
-            proc.wait(timeout=2.0)
+            proc.wait(timeout=20.0)
         except subprocess.TimeoutExpired:
             try:
                 os.killpg(pgid, signal.SIGKILL)
-                proc.wait(timeout=2.0)
+                proc.wait(timeout=20.0)
             except Exception:
                 pass
         except ProcessLookupError:
@@ -608,7 +608,7 @@ class LocalSubprocessBackend(ExecutionBackend):
                 duration_s=0.0,
                 error="missing process handle",
             )
-        timeout_s = float(handle.metadata.get("timeout_s", 180.0))
+        timeout_s = float(handle.metadata.get("timeout_s", BudgetConfig.default_job_timeout_s))
         deadline = handle.started_at + timeout_s
         while proc.poll() is None:
             if clock.now() >= deadline:
@@ -706,7 +706,7 @@ class RealSingleGpuBackend(LocalSubprocessBackend):
                 env=env,
                 capture_output=True,
                 text=True,
-                timeout=5.0,
+                timeout=50.0,
                 check=False,
             )
             if proc.returncode != 0:

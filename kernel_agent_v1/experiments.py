@@ -78,8 +78,8 @@ def default_comparison_campaign() -> list[dict[str, Any]]:
 
 def run_three_way_comparison(
     base_dir: str | Path | None = None,
-    total_wall_budget_s: float = 2000.0,
-    total_gpu_budget_s: float = 1600.0,
+    total_wall_budget_s: float = 20_000.0,
+    total_gpu_budget_s: float = 16_000.0,
 ) -> dict[str, RunMetrics]:
     """Run whole_round, chunked_fcfs, and chunked_dynamic under identical protocol & budget."""
     results: dict[str, RunMetrics] = {}
@@ -94,8 +94,7 @@ def run_three_way_comparison(
                 total_wall_budget_s=total_wall_budget_s,
                 total_gpu_budget_s=total_gpu_budget_s,
                 total_model_budget_cost=50.0,
-                version_deadline_s=600.0,
-                version_diag_budget_s=100.0,
+                version_diag_budget_s=1000.0,
             ),
         )
         rt = KernelLabRuntime(

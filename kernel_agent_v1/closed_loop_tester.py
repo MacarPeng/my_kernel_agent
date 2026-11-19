@@ -271,11 +271,8 @@ class ClosedLoopTester:
             min_gain_threshold=0.01,
             stagnation_limit=3,
             budgets=BudgetConfig(
-                total_wall_budget_s=3600.0,
-                total_gpu_budget_s=2400.0,
+                total_gpu_budget_s=24_000.0,
                 total_model_budget_cost=100.0,
-                version_deadline_s=600.0,
-                version_diag_budget_s=120.0,
             ),
         )
         clock: Clock = SimClock() if self.backend_kind == "sim" else RealClock()

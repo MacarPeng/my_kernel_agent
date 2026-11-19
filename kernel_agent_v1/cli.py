@@ -46,10 +46,10 @@ def _positive_seconds(value: str) -> float:
 
 def _run_end_to_end(args: argparse.Namespace) -> int:
     run_dir = Path(args.run_dir) if args.run_dir else Path(tempfile.mkdtemp(prefix="kl-run-"))
-    budgets = BudgetConfig(total_wall_budget_s=1800.0, total_gpu_budget_s=1200.0)
+    budgets = BudgetConfig(total_wall_budget_s=18_000.0, total_gpu_budget_s=12_000.0)
     final_timeout_s = args.final_eval_timeout_s
     if final_timeout_s is None and args.backend == "real-gpu":
-        final_timeout_s = 3600.0
+        final_timeout_s = 36_000.0
     if final_timeout_s is not None:
         budgets.final_eval_job_timeout_s = final_timeout_s
         budgets.reserve_final_eval_s = len(FINAL_BLOCK_IDS) * final_timeout_s
@@ -57,7 +57,7 @@ def _run_end_to_end(args: argparse.Namespace) -> int:
         budgets.total_gpu_budget_s += budgets.reserve_final_eval_s
     abba_timeout_s = args.abba_retest_timeout_s
     if abba_timeout_s is None and args.backend == "real-gpu":
-        abba_timeout_s = 1800.0
+        abba_timeout_s = 18_000.0
     if abba_timeout_s is not None:
         budgets.abba_retest_job_timeout_s = abba_timeout_s
         budgets.reserve_retest_s = abba_timeout_s
@@ -344,19 +344,19 @@ def main(argv: list[str] | None = None) -> int:
     )
     run_p.add_argument(
         "--wall-budget-s", type=float,
-        help="Total wall-clock budget in seconds. Default: 1800 plus ABBA and final-eval reserves on real GPU.",
+        help="Total wall-clock budget in seconds. Default: 18000 plus ABBA and final-eval reserves on real GPU.",
     )
     run_p.add_argument(
         "--gpu-budget-s", type=float,
-        help="Total GPU scheduling budget in seconds. Default: 1200 plus ABBA and final-eval reserves on real GPU.",
+        help="Total GPU scheduling budget in seconds. Default: 12000 plus ABBA and final-eval reserves on real GPU.",
     )
     run_p.add_argument(
         "--final-eval-timeout-s", type=_positive_seconds,
-        help="Timeout per final-eval block in seconds. Default: 3600 on real GPU.",
+        help="Timeout per final-eval block in seconds. Default: 36000 on real GPU.",
     )
     run_p.add_argument(
         "--abba-retest-timeout-s", type=_positive_seconds,
-        help="Timeout per full ABBA retest in seconds. Default: 1800 on real GPU.",
+        help="Timeout per full ABBA retest in seconds. Default: 18000 on real GPU.",
     )
     run_p.add_argument("--max-rounds", type=int, default=3)
     run_p.add_argument("--smoke-cases", type=int, default=0)

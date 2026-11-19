@@ -175,7 +175,7 @@ class DualResearch:
         event = rt.leader.propose_task_event(
             task_id, kind, "gpu", version.direction_id, version.version_id,
             version.artifact_id, reply_to="diagnosis",
-            estimated_duration_s=limit, post_cpu_kind=post_cpu_kind,
+            post_cpu_kind=post_cpu_kind,
             produces=[f"diagnosis_ready:{task_id}"],
         )
         event.block_id = block_id

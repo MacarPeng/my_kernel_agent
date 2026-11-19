@@ -39,7 +39,7 @@ class DeepSeekConfig:
     api_key_env: str = "DEEPSEEK_API_KEY"
     temperature: float = 0.2
     max_tokens: int = 4096
-    timeout_s: float = 60.0
+    timeout_s: float = 600.0
     live_enabled: bool = False  # Intentionally False until user chooses to wire live API
     input_cost_per_1m: float = 0.27
     output_cost_per_1m: float = 1.10
