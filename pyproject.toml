@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kernel-agent-v1"
+version = "0.1.0"
+description = "KernelLab V1 single-GPU asynchronous kernel optimization runtime"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = []
+
+[project.scripts]
+kernel-agent-v1 = "kernel_agent_v1.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["kernel_agent_v1*"]
