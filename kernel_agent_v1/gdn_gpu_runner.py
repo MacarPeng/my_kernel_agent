@@ -141,15 +141,23 @@ def _run_benchmark_block(inputs: dict[str, Any], torch_mod) -> dict[str, Any]:
     for uid in eval_uuids:
         row = by_uuid[uid]
         args = _make_deterministic_gdn_inputs(row, torch_mod, device)
-        ref_out = ref_fn(*args)
-        cand_out = cand_fn(*args)
-        correct = _check_correctness(cand_out, ref_out, torch_mod)
-
         if torch_mod.cuda.is_available():
-            # Use 1 timed pass for slow pure-Python reference fallback; full warmup+iters for candidate
-            base_ms = _time_cuda_fn(ref_fn, args, torch_mod, warmup=0, iters=1)
+            # Time reference in a single pass to halve pure-Python reference overhead
+            torch_mod.cuda.synchronize()
+            s_ref = torch_mod.cuda.Event(enable_timing=True)
+            e_ref = torch_mod.cuda.Event(enable_timing=True)
+            s_ref.record()
+            ref_out = ref_fn(*args)
+            e_ref.record()
+            torch_mod.cuda.synchronize()
+            base_ms = float(s_ref.elapsed_time(e_ref))
+            cand_out = cand_fn(*args)
+            correct = _check_correctness(cand_out, ref_out, torch_mod)
             cand_ms = _time_cuda_fn(cand_fn, args, torch_mod, warmup=1, iters=2)
         else:
+            ref_out = ref_fn(*args)
+            cand_out = cand_fn(*args)
+            correct = _check_correctness(cand_out, ref_out, torch_mod)
             base_ms, cand_ms = 1.0, 1.0
 
         cases.append(

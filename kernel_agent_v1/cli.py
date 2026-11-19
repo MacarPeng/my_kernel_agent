@@ -116,7 +116,11 @@ def _run_end_to_end(args: argparse.Namespace) -> int:
         print(f"Failed to package seed candidate: {seed_evt.to_dict()}", file=sys.stderr)
         return 2
 
-    # Inject candidate_path into RealSingleGpuBackend inputs
+    artifact_entrypoints: dict[str, str] = {
+        "art-seed-v0": str(Path(seed_pkg.root_dir) / seed_pkg.manifest.entrypoint)
+    }
+
+    # Inject candidate_path (and incumbent_path for ABBA) into RealSingleGpuBackend inputs
     if args.backend == "real-gpu":
         orig_dispatch = rt.dispatch_gpu_if_ready
 
@@ -126,6 +130,11 @@ def _run_end_to_end(args: argparse.Namespace) -> int:
                 pkg = rt.packages_by_id.get(task.package_id) if task.package_id else None
                 if pkg is not None:
                     extra["candidate_path"] = str(Path(pkg.root_dir) / pkg.manifest.entrypoint)
+                elif task.artifact_id and task.artifact_id in artifact_entrypoints:
+                    extra["candidate_path"] = artifact_entrypoints[task.artifact_id]
+                inc_art = task.metadata.get("incumbent_artifact_id")
+                if inc_art and inc_art in artifact_entrypoints:
+                    extra["incumbent_path"] = artifact_entrypoints[inc_art]
                 extra["device_id"] = evaluator.device_id
                 if args.smoke_cases > 0:
                     extra["max_cases"] = args.smoke_cases
@@ -169,6 +178,14 @@ def _run_end_to_end(args: argparse.Namespace) -> int:
         runtime.controller.ledger.model_cost_used += u1.cost_usd + u2.cost_usd
         if pkg is not None:
             runtime.packages_by_id[pkg.manifest.package_id] = pkg
+            artifact_entrypoints[pkg.manifest.artifact_id] = str(
+                Path(pkg.root_dir) / pkg.manifest.entrypoint
+            )
+        else:
+            print(
+                f"[coder-blocked] cmd={cmd.head.command_id} details={evt.extra}",
+                file=sys.stderr,
+            )
         await runner.submit_external_event(evt)
 
     runner = AsyncKernelLabRunner(
