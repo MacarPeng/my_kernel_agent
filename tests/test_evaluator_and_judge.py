@@ -238,9 +238,17 @@ class TestEvaluatorAndJudge(unittest.TestCase):
                     "version_id": "V2",
                     "artifact_id": "art-2",
                     "geomean_speedup": 1.24,
+                    "cases": [{"uuid": uid, "correct": True} for uid in ev.uuids],
                     "status": "completed",
                 },
             )
+            if fb == "F3":
+                df.payload["cases"][0]["correct"] = False
+                rejected, _ = judge.adjudicate(df)
+                self.assertEqual(rejected.extra["verdict"], "final_eval_failed")
+                self.assertFalse(rejected.extra["final_eval_done"])
+                self.assertNotIn("F3", judge.incumbent.final_eval_blocks)
+                df.payload["cases"][0]["correct"] = True
             ef, _ = judge.adjudicate(df)
         self.assertEqual(ef.extra["verdict"], "final_verified")
         self.assertEqual(judge.incumbent.verification_level, VerificationLevel.FINAL_VERIFIED.value)

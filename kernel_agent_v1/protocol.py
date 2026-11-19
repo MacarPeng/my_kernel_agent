@@ -487,6 +487,7 @@ class RuntimeConfig:
     num_benchmark_blocks: int = 4
     cases_per_block: int = 25
     final_eval_blocks: int = 3
+    max_versions: int | None = None
     require_abba_on_first_candidate: bool = False
     snapshot_interval: int = 10
     budgets: BudgetConfig = field(default_factory=BudgetConfig)

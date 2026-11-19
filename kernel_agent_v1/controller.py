@@ -317,7 +317,7 @@ class Controller:
             self.satisfied_tokens.add(f"code_ready:{event.command_id}")
 
         if event.kind == "implement_kernel":
-            if direction_id in self.paused_routes:
+            if direction_id in self.paused_routes or self.version_cap_reached:
                 return
             self.candidate_ready_seq += 1
             info["ready_seq"] = self.candidate_ready_seq
@@ -563,16 +563,6 @@ class Controller:
                 v.retest_status = "completed"
                 if event.receipt_id:
                     v.close_receipt_ids.append(event.receipt_id)
-        elif task.kind == JobKind.FINAL_EVAL.value:
-            final_tasks = [
-                t
-                for t in self.tasks.values()
-                if t.kind == JobKind.FINAL_EVAL.value and t.version_id == task.version_id
-            ]
-            if final_tasks and all(
-                t.status == TaskStatus.COMPLETED.value for t in final_tasks
-            ):
-                self.final_eval_completed = True
 
     def _on_result_ready(self, event: Event) -> None:
         x = event.extra
@@ -817,13 +807,18 @@ class Controller:
                 self.ledger.admission_frozen = True
                 self.ledger.freeze_reason = "budget_near_exhaustion"
 
+    @property
+    def version_cap_reached(self) -> bool:
+        cap = self.config.max_versions
+        return cap is not None and self.version_seq >= cap
+
     def admit_next_version(self) -> VersionRecord | None:
         """Admit Vn+1 from pending candidates ONLY when no version is active/closing and GPU is clean."""
         if self.active_version is not None:
             return None
         if self.gpu_busy or not self.gpu_cleanup_confirmed or self.gpu_halt_reason:
             return None
-        if self.ledger.admission_frozen or self.final_eval_requested:
+        if self.ledger.admission_frozen or self.final_eval_requested or self.version_cap_reached:
             return None
 
         now = self.clock.now()
@@ -854,6 +849,11 @@ class Controller:
         self.pending_candidates.pop(chosen_dir, None)
         self.version_seq += 1
         vid = f"V{self.version_seq}"
+        self.store.append_lifecycle({
+            "event": "version_admitted", "timestamp": self.clock.now_iso(),
+            "version_id": vid, "artifact_id": chosen["artifact_id"],
+            "package_id": chosen.get("package_id"),
+        })
         art_id = str(chosen["artifact_id"])
         parent_vid = str(chosen.get("parent_version_id") or "V0")
         b = self.config.budgets
@@ -942,12 +942,20 @@ class Controller:
         """Register the 3 independent final eval GPU blocks for the retained incumbent (§7)."""
         if (
             self.final_eval_requested
+            or self.active_version is not None
+            or self.gpu_busy
+            or (self.config.max_versions is not None and not self.version_cap_reached)
             or self.global_best_version_id is None
             or self.global_best_artifact_id is None
         ):
             return []
         self.final_eval_requested = True
         self.final_eval_version_id = self.global_best_version_id
+        self.store.append_lifecycle({
+            "event": "final_eval_scheduled", "timestamp": self.clock.now_iso(),
+            "version_id": self.global_best_version_id, "artifact_id": self.global_best_artifact_id,
+            "last_admitted_version": self.version_seq, "blocks": FINAL_BLOCK_IDS,
+        })
         package_id = self._benchmark_package_id(
             self.global_best_version_id, self.global_best_artifact_id
         )

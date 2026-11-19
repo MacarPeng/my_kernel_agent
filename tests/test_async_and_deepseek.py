@@ -279,6 +279,20 @@ class TestAsyncAndDeepSeek(unittest.TestCase):
                     self.assertTrue(evidence["valid"], evidence["issues"])
                     self.assertEqual({row["attempt_id"] for row in evidence["cases"]}, {event.attempt_id})
 
+    def test_ncu_preamble_and_missing_spill_counter(self) -> None:
+        parsed = parse_ncu_csv(
+            '==PROF== Connected to process 68910\n'
+            '==PROF== Disconnected from process 68910\n'
+            '"Kernel Name","Metric Name","Metric Value"\n'
+            '"_gdn_prefill_kernel","launch__registers_per_thread","168"\n'
+            '"_gdn_prefill_kernel","smsp__sass_lmem_bytes_per_thread.sum","n/a"\n'
+        )
+        self.assertEqual(parsed["kernel_names"], ["_gdn_prefill_kernel"])
+        self.assertEqual(parsed["counters"]["registers_per_thread"], 168)
+        self.assertIsNone(parsed["register_spill_detected"])
+        self.assertIsNone(parsed["counters"]["lmem_spill_bytes"])
+        self.assertEqual(parse_ncu_csv("==PROF== No kernels were profiled")["counters"], {})
+
     def test_ncu_csv_parser_and_real_single_gpu_backend_cleanup_probe(self) -> None:
         csv_sample = (
             '"ID","Metric Name","Metric Value"\n'

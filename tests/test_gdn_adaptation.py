@@ -181,6 +181,50 @@ class TestGdnAdaptation(unittest.TestCase):
                 [t["timeout_s"] for t in tasks if t["kind"] == "abba_retest"], [18_000.0]
             )
 
+    def test_version_cap_finishes_v100_then_evaluates_only_incumbent(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            evaluator = TrustedEvaluator.from_official_gdn_dataset()
+            backend = TimedBackend(evaluator)
+            backend.set_behavior("benchmark_block", {"duration_s": 1.0, "speedup": 1.2})
+            source = seed_gdn_candidate_source()
+            proposals = 0
+
+            def reply(messages):
+                nonlocal proposals
+                request = json.loads(messages[-1].content)
+                if "head" not in request:
+                    return {"allowed_paths": ["kernel.py"], "preserve_target": False}
+                proposals += 1
+                return {
+                    "artifact_id": f"candidate-{proposals}", "entrypoint": "kernel.py",
+                    "files": {"kernel.py": source + f"\n# candidate {proposals}\n"},
+                }
+
+            with patch("kernel_agent_v1.cli.SimulatedExecutionBackend", return_value=backend), \
+                 patch("kernel_agent_v1.cli.DeepSeekClient",
+                       return_value=ScriptedDeepSeekClient(reply)), redirect_stdout(StringIO()):
+                rc = cli_main(["run", "--deepseek-live", "--max-versions", "100", "--run-dir", tmp])
+
+            self.assertEqual(rc, 0)
+            self.assertEqual(proposals, 99)
+            result = json.loads((Path(tmp) / "run_result.json").read_text())
+            self.assertEqual(result["last_admitted_version"], 100)
+            self.assertTrue(result["last_admitted_version_closed"])
+            self.assertEqual(result["versions_closed"], 100)
+            self.assertEqual(result["final_eval_version_id"], "V1")
+            self.assertTrue(result["final_eval_completed"])
+            lifecycle = [json.loads(row) for row in (Path(tmp) / "lifecycle.jsonl").read_text().splitlines()]
+            final_schedules = [row for row in lifecycle if row["event"] == "final_eval_scheduled"]
+            self.assertEqual(len(final_schedules), 1)
+            self.assertEqual(final_schedules[0]["last_admitted_version"], 100)
+            events = [event for _, event in RunStore(tmp).load_events()]
+            terminal_close = next(i for i, event in enumerate(events)
+                                  if event.event == EventType.VERSION_CLOSED.value and event.version_id == "V100")
+            final_jobs = [(i, event) for i, event in enumerate(events) if event.kind == "final_eval"]
+            self.assertEqual([event.block_id for i, event in final_jobs], ["F1", "F2", "F3"])
+            self.assertTrue(all(i > terminal_close and event.version_id == "V1" for i, event in final_jobs))
+            self.assertTrue((Path(tmp) / "evidence" / "llm-00198-response.json").exists())
+
     def test_dual_researcher_uses_diagnosis_available_before_command(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = RunStore(tmp)
@@ -377,6 +421,70 @@ class TestGdnAdaptation(unittest.TestCase):
                 self.assertEqual(metrics["stop_reason"], "completed")
                 ledger = RunStore(tmp).load_snapshot()["ledger"]
                 self.assertAlmostEqual(ledger["model_cost_used"], 0.0005 * len(replies))
+
+    def test_fla_timing_baseline_selection_and_dispatch(self) -> None:
+        import os
+        import types
+        from kernel_agent_v1.gdn_gpu_runner import (
+            FLA_BASELINE_NAME,
+            FLA_COMMIT,
+            FLA_ENVIRONMENT,
+            _build_timing_baseline_fn,
+        )
+
+        defn = load_official_definition()
+        # Missing fla on CUDA raises clear error (never silently fakes 300x vs reference)
+        with patch("kernel_agent_v1.gdn_gpu_runner.importlib.import_module", side_effect=ImportError("no fla")):
+            with self.assertRaises(RuntimeError) as ctx:
+                _build_timing_baseline_fn("fla", defn, cuda_available=True)
+            self.assertIn(FLA_COMMIT, str(ctx.exception))
+
+        # Explicit reference fallback works
+        fake_ref = object()
+        fn_ref, name_ref = _build_timing_baseline_fn(
+            "reference", defn, cuda_available=True, ref_fn=fake_ref
+        )
+        self.assertIs(fn_ref, fake_ref)
+        self.assertEqual(name_ref, "reference")
+
+        # Mocked FLA verifies env vars + <=64 recurrent vs >64 chunk dispatch
+        calls: list[str] = []
+
+        class _FakeTensor:
+            def __init__(self, seq_len: int) -> None:
+                self.shape = (seq_len, 4, 128)
+
+            def unsqueeze(self, dim: int):
+                return self
+
+            def squeeze(self, dim: int):
+                return self
+
+        def _fake_recurrent(**kwargs):
+            calls.append("recurrent")
+            self.assertTrue(kwargs["state_v_first"])
+            self.assertTrue(kwargs["use_gate_in_kernel"])
+            self.assertTrue(kwargs["use_beta_sigmoid_in_kernel"])
+            return kwargs["v"], kwargs["initial_state"]
+
+        def _fake_chunk(**kwargs):
+            calls.append("chunk")
+            return kwargs["v"], kwargs["initial_state"]
+
+        fake_mod = types.SimpleNamespace(
+            fused_recurrent_gated_delta_rule=_fake_recurrent,
+            chunk_gated_delta_rule=_fake_chunk,
+        )
+        with patch("kernel_agent_v1.gdn_gpu_runner.importlib.import_module", return_value=fake_mod):
+            fn, name = _build_timing_baseline_fn("fla", defn, cuda_available=True)
+            self.assertEqual(name, FLA_BASELINE_NAME)
+            for k, v in FLA_ENVIRONMENT.items():
+                self.assertEqual(os.environ.get(k), v)
+            t64 = _FakeTensor(64)
+            fn(t64, t64, t64, None, None, t64, None, t64, None, None)
+            t128 = _FakeTensor(128)
+            fn(t128, t128, t128, None, None, t128, None, t128, None, 0.0)
+        self.assertEqual(calls, ["recurrent", "chunk"])
 
 
 if __name__ == "__main__":

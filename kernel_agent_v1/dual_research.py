@@ -84,7 +84,10 @@ class DualResearch:
                 parsed, usage = await _complete_json(self.client, [
                     LLMMessage("system", (
                         "You are the Diagnosis Researcher. Use the existing measurement and compile "
-                        "evidence first. Return JSON with observation, explanation, limitations, "
+                        "evidence first. Attribute NCU counters only to the kernel named in the "
+                        "report. A copy or helper kernel cannot establish the recurrence kernel's "
+                        "performance. Missing or null counters are unknown, including spill. "
+                        "Return JSON with observation, explanation, limitations, "
                         "and design_impact strings. Distinguish measurements from hypotheses. "
                         "If additional GPU evidence distinguishes competing explanations and would "
                         "change a design decision, optionally return diagnostic with kind, "

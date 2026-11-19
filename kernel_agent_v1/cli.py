@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+from dataclasses import asdict
 import json
 import math
 import shutil
 from pathlib import Path
 import sys
 import tempfile
+import traceback
+from urllib.error import HTTPError
 
 from kernel_agent_v1.async_runtime import AsyncKernelLabRunner, AsyncRunnerHooks
 from kernel_agent_v1.backends import RealSingleGpuBackend, SimulatedExecutionBackend
@@ -24,6 +27,7 @@ from kernel_agent_v1.llm import (
     DeepSeekCoderAdapter,
     DeepSeekConfig,
     DeepSeekResearcherAdapter,
+    LLMClient,
     LLMResponseFormatError,
 )
 from kernel_agent_v1.protocol import (
@@ -44,8 +48,52 @@ def _positive_seconds(value: str) -> float:
     return seconds
 
 
+class _AuditedLLMClient(LLMClient):
+    def __init__(self, client: LLMClient, runtime: KernelLabRuntime) -> None:
+        self.client = client
+        self.runtime = runtime
+        self.sequence = 0
+
+    async def complete(self, messages, *, json_mode=True):
+        store, clock = self.runtime.store, self.runtime.clock
+        for attempt in range(1, 4):
+            self.sequence += 1
+            call_id = f"llm-{self.sequence:05d}"
+            # HTTP credentials never pass through this interface.
+            store.write_evidence(f"{call_id}-request", {
+                "started_at": clock.now_iso(), "json_mode": json_mode, "attempt": attempt,
+                "messages": [asdict(message) for message in messages],
+            })
+            try:
+                response = await self.client.complete(messages, json_mode=json_mode)
+            except (Exception, asyncio.CancelledError) as exc:
+                store.write_evidence(f"{call_id}-response", {
+                    "finished_at": clock.now_iso(), "error": str(exc), "type": type(exc).__name__,
+                })
+                transient = (
+                    exc.code == 429 or 500 <= exc.code < 600
+                    if isinstance(exc, HTTPError) else isinstance(exc, OSError)
+                )
+                if not transient or attempt == 3:
+                    raise
+                await asyncio.sleep(2 ** attempt)
+            else:
+                store.write_evidence(f"{call_id}-response", {
+                    "finished_at": clock.now_iso(), **asdict(response),
+                })
+                return response
+
+
 def _run_end_to_end(args: argparse.Namespace) -> int:
     run_dir = Path(args.run_dir) if args.run_dir else Path(tempfile.mkdtemp(prefix="kl-run-"))
+    if run_dir.exists():
+        existing_data = any(
+            path.name != "console.log" and (not path.is_dir() or any(path.iterdir()))
+            for path in run_dir.iterdir()
+        )
+        if existing_data:
+            print(f"Run directory already contains experiment data: {run_dir}", file=sys.stderr)
+            return 2
     budgets = BudgetConfig(total_wall_budget_s=18_000.0, total_gpu_budget_s=12_000.0)
     final_timeout_s = args.final_eval_timeout_s
     if final_timeout_s is None and args.backend == "real-gpu":
@@ -72,8 +120,12 @@ def _run_end_to_end(args: argparse.Namespace) -> int:
         run_id=args.run_id,
         gpu_name=args.gpu,
         scheduler_mode=args.scheduler,
+        max_versions=args.max_versions,
         budgets=budgets,
     )
+    if args.max_versions is not None:
+        # This campaign is explicitly version-limited, including non-improving versions.
+        cfg.stagnation_limit = max(cfg.stagnation_limit, args.max_versions)
     evaluator = TrustedEvaluator.from_official_gdn_dataset(
         device_id=f"{cfg.gpu_name}:0",
         min_gain_threshold=cfg.min_gain_threshold,
@@ -108,6 +160,11 @@ def _run_end_to_end(args: argparse.Namespace) -> int:
         backend = SimulatedExecutionBackend(evaluator)
 
     rt = KernelLabRuntime(run_dir=run_dir, config=cfg, clock=clock, backend=backend)
+    rt.store.write_json("run_config", {
+        "args": vars(args),
+        "runtime_config": asdict(cfg),
+        "started_at": clock.now_iso(),
+    })
     rt.evaluator = evaluator
     rt.operator.evaluator = evaluator
     rt.judge.evaluator = evaluator
@@ -135,6 +192,7 @@ def _run_end_to_end(args: argparse.Namespace) -> int:
         allowed_paths=("kernel.py",),
         preserve_target=False,
     )
+    rt.store.write_evidence(f"command-{seed_cmd.head.command_id}", seed_cmd.to_dict())
     seed_evt, seed_pkg = rt.submit_command_and_package(
         seed_cmd,
         {
@@ -163,6 +221,7 @@ def _run_end_to_end(args: argparse.Namespace) -> int:
                     incumbent_path = Path(inc_pkg.root_dir) / inc_pkg.manifest.entrypoint
                     extra["incumbent_path"] = str(incumbent_path.resolve())
                 extra["device_id"] = evaluator.device_id
+                extra["timing_baseline"] = args.timing_baseline
                 if args.smoke_cases > 0:
                     extra["max_cases"] = args.smoke_cases
                 return extra
@@ -178,6 +237,8 @@ def _run_end_to_end(args: argparse.Namespace) -> int:
             live_enabled=bool(args.deepseek_live),
         )
     )
+    if args.audit_llm or args.max_versions is not None:
+        llm_client = _AuditedLLMClient(llm_client, rt)
     task_definition = load_official_definition()
     res_adapter = DeepSeekResearcherAdapter(llm_client, rt.leader, task_definition=task_definition)
     coder_adapter = DeepSeekCoderAdapter(llm_client, rt.coder, task_definition=task_definition)
@@ -191,7 +252,11 @@ def _run_end_to_end(args: argparse.Namespace) -> int:
     )
 
     async def _on_evidence(runtime: KernelLabRuntime, delivery: EvidenceDelivery) -> None:
-        if not args.deepseek_live or rounds_remaining[0] <= 0:
+        if (
+            not args.deepseek_live
+            or runtime.controller.version_cap_reached
+            or (args.max_versions is None and rounds_remaining[0] <= 0)
+        ):
             return
         if delivery.result_kind not in (
             ResultKind.BENCHMARK_PARTIAL.value,
@@ -220,53 +285,64 @@ def _run_end_to_end(args: argparse.Namespace) -> int:
             delivery.block_id and delivery.block_id != "W1"
         ):
             return
-        rounds_remaining[0] -= 1
-        try:
-            design_role = "Design" if dual_research is not None else "Leader"
-            with runtime.timeline.measure(design_role, f"Plan from {delivery.receipt_id}"):
-                cmd, plan, usage = await res_adapter.plan_from_evidence(
-                    researcher_id="res_main",
-                    direction_id="gdn-prefill-main",
-                    deliveries=[delivery],
-                    repair_context=repair_context,
-                    dual_research=dual_research,
-                    default_target=TargetRef(
-                        delivery.version_id or "V1", delivery.artifact_id or "art-seed-v0"
-                    ),
+        if args.max_versions is None:
+            rounds_remaining[0] -= 1
+        feedback = None
+        for _ in range(3 if args.max_versions is not None else 1):
+            if runtime.controller.version_cap_reached or runtime.controller.ledger.admission_frozen:
+                return
+            try:
+                design_role = "Design" if dual_research is not None else "Leader"
+                with runtime.timeline.measure(design_role, f"Plan from {delivery.receipt_id}"):
+                    cmd, plan, usage = await res_adapter.plan_from_evidence(
+                        researcher_id="res_main",
+                        direction_id="gdn-prefill-main",
+                        deliveries=[delivery],
+                        repair_context=repair_context,
+                        dual_research=dual_research,
+                        generation_feedback=feedback,
+                        default_target=TargetRef(
+                            delivery.version_id or "V1", delivery.artifact_id or "art-seed-v0"
+                        ),
+                    )
+            except LLMResponseFormatError as exc:
+                runtime.controller.ledger.model_cost_used += exc.usage.cost_usd
+                print(
+                    f"[model-error] stage=researcher version={delivery.version_id} "
+                    f"receipt={delivery.receipt_id} error={exc}",
+                    file=sys.stderr,
                 )
-        except LLMResponseFormatError as exc:
-            runtime.controller.ledger.model_cost_used += exc.usage.cost_usd
-            print(
-                f"[model-error] stage=researcher version={delivery.version_id} "
-                f"receipt={delivery.receipt_id} error={exc}",
-                file=sys.stderr,
-            )
-            return
-        runtime.controller.ledger.model_cost_used += usage.cost_usd
-        if "diagnosis_feedback" in plan:
-            runtime.store.write_evidence(f"design-{cmd.head.command_id}", {
-                "command_id": cmd.head.command_id,
-                "trigger_receipt_id": delivery.receipt_id,
-                "version_id": delivery.version_id,
-                "issued_at_s": runtime.clock.now(),
-                **plan["diagnosis_feedback"],
-            })
-        try:
-            with runtime.timeline.measure("Coder", f"Implement {cmd.head.command_id}") as span:
-                evt, pkg, usage = await coder_adapter.implement(cmd, repair_context=repair_context)
-                span.status = evt.event
-        except LLMResponseFormatError as exc:
-            usage = exc.usage
-            evt, pkg = runtime.coder.execute_command(cmd, {"blocked_reason": str(exc)})
-        runtime.controller.ledger.model_cost_used += usage.cost_usd
-        if pkg is not None:
-            runtime.packages_by_id[pkg.manifest.package_id] = pkg
-        else:
-            print(
-                f"[coder-blocked] cmd={cmd.head.command_id} details={evt.extra}",
-                file=sys.stderr,
-            )
-        await runner.submit_external_event(evt)
+                feedback = str(exc)
+                continue
+            runtime.controller.ledger.model_cost_used += usage.cost_usd
+            runtime.store.write_evidence(f"command-{cmd.head.command_id}", cmd.to_dict())
+            if "diagnosis_feedback" in plan:
+                runtime.store.write_evidence(f"design-{cmd.head.command_id}", {
+                    "command_id": cmd.head.command_id,
+                    "trigger_receipt_id": delivery.receipt_id,
+                    "version_id": delivery.version_id,
+                    "issued_at_s": runtime.clock.now(),
+                    **plan["diagnosis_feedback"],
+                })
+            try:
+                with runtime.timeline.measure("Coder", f"Implement {cmd.head.command_id}") as span:
+                    evt, pkg, usage = await coder_adapter.implement(cmd, repair_context=repair_context)
+                    span.status = evt.event
+            except LLMResponseFormatError as exc:
+                usage = exc.usage
+                evt, pkg = runtime.coder.execute_command(cmd, {"blocked_reason": str(exc)})
+            runtime.controller.ledger.model_cost_used += usage.cost_usd
+            if pkg is not None:
+                runtime.packages_by_id[pkg.manifest.package_id] = pkg
+            else:
+                print(
+                    f"[coder-blocked] cmd={cmd.head.command_id} details={evt.extra}",
+                    file=sys.stderr,
+                )
+            await runner.submit_external_event(evt)
+            if pkg is not None:
+                return
+            feedback = json.dumps(evt.extra, ensure_ascii=False)
 
     runner = AsyncKernelLabRunner(
         rt, hooks=AsyncRunnerHooks(
@@ -277,6 +353,15 @@ def _run_end_to_end(args: argparse.Namespace) -> int:
     timeline_path = (run_dir / "pipeline_timeline.html").resolve()
     try:
         metrics = asyncio.run(runner.run())
+    except (Exception, KeyboardInterrupt) as exc:
+        rt.controller.flush_snapshot()
+        rt.store.write_json("run_result", {
+            "status": "interrupted" if isinstance(exc, KeyboardInterrupt) else "failed",
+            "target_version": args.max_versions,
+            "last_admitted_version": rt.controller.version_seq,
+            "error": traceback.format_exc(),
+        })
+        raise
     finally:
         rt.timeline.write_html(timeline_path, cfg.run_id)
     # Surface any job execution errors clearly in stderr for immediate diagnostics
@@ -289,6 +374,15 @@ def _run_end_to_end(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
     result = metrics.to_dict()
+    result.update({
+        "status": "completed" if rt.controller.final_eval_completed else "incomplete",
+        "target_version": args.max_versions,
+        "last_admitted_version": rt.controller.version_seq,
+        "last_admitted_version_closed": f"V{rt.controller.version_seq}" in rt.controller.closed_versions,
+        "final_eval_score": rt.judge.incumbent.final_eval_score,
+        "final_eval_version_id": rt.controller.final_eval_version_id,
+        "final_eval_completed": rt.controller.final_eval_completed,
+    })
     result["role_active_s"] = rt.timeline.active_seconds()
     result["pipeline_timeline"] = str(timeline_path)
     if dual_research is not None:
@@ -302,8 +396,9 @@ def _run_end_to_end(args: argparse.Namespace) -> int:
                 and evt.event == "gpu_job_finished"
             ),
         }
+    rt.store.write_json("run_result", result)
     print(json.dumps(result, indent=2, ensure_ascii=False))
-    return 0
+    return 0 if args.max_versions is None or rt.controller.final_eval_completed else 2
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -358,7 +453,19 @@ def main(argv: list[str] | None = None) -> int:
         "--abba-retest-timeout-s", type=_positive_seconds,
         help="Timeout per full ABBA retest in seconds. Default: 18000 on real GPU.",
     )
-    run_p.add_argument("--max-rounds", type=int, default=3)
+    limits = run_p.add_mutually_exclusive_group()
+    limits.add_argument("--max-rounds", type=int, default=3, help="Maximum model proposal rounds.")
+    limits.add_argument(
+        "--max-versions", type=int,
+        help="Include seed V1 in the version count and run final evaluation only after the target closes.",
+    )
+    run_p.add_argument("--audit-llm", action="store_true", help="Persist model requests and responses.")
+    run_p.add_argument(
+        "--timing-baseline",
+        choices=("fla", "reference"),
+        default="fla",
+        help="GPU timing baseline: pinned FLA v0.5.2 (default) or pure-Python reference fallback.",
+    )
     run_p.add_argument("--smoke-cases", type=int, default=0)
     run_p.add_argument("--deepseek-live", action="store_true")
     run_p.add_argument(
@@ -386,6 +493,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "run":
         if args.dual_researcher and not args.deepseek_live:
             run_p.error("--dual-researcher requires --deepseek-live")
+        if args.max_versions is not None and args.max_versions < 1:
+            run_p.error("--max-versions must be at least 1")
+        if args.max_versions is not None and args.max_versions > 1 and not args.deepseek_live:
+            run_p.error("--max-versions above 1 requires --deepseek-live")
         return _run_end_to_end(args)
     return 1
 

@@ -265,6 +265,7 @@ class DeepSeekResearcherAdapter:
         *,
         repair_context: dict[str, Any] | None = None,
         dual_research: DualResearch | None = None,
+        generation_feedback: str | None = None,
     ) -> tuple[Command, dict[str, Any], LLMUsage]:
         researcher = self.leader.ensure_researcher(researcher_id)
         rid = self.leader.next_research_id()
@@ -314,6 +315,9 @@ class DeepSeekResearcherAdapter:
                 "artifact_id": default_target.artifact_id,
             },
         }
+        if generation_feedback:
+            user_payload["previous_generation_failure"] = generation_feedback
+            sys_prompt += " Address the previous generation failure in your new plan."
         if self.task_definition is not None:
             user_payload["task_definition"] = self.task_definition
         if repair_context is not None:

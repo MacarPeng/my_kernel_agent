@@ -8,6 +8,7 @@ import csv
 from dataclasses import dataclass, field
 import io
 import json
+import math
 import os
 from pathlib import Path
 import signal
@@ -539,9 +540,10 @@ class LocalSubprocessBackend(ExecutionBackend):
         if returncode != 0:
             status = "infra_failed"
             error = stderr_b.decode("utf-8", errors="replace")
-        elif handle.kind in (JobKind.BENCHMARK_BLOCK.value, JobKind.PROBE.value) and failure in (
-            "compile_failed", "candidate_failed", "numerical_failed"
-        ):
+        elif handle.kind in (
+            JobKind.BENCHMARK_BLOCK.value, JobKind.PROBE.value,
+            JobKind.ABBA_RETEST.value, JobKind.FINAL_EVAL.value,
+        ) and failure in ("compile_failed", "candidate_failed", "numerical_failed"):
             status = failure
             error = payload.get("error")
         else:
@@ -641,33 +643,44 @@ class LocalSubprocessBackend(ExecutionBackend):
 def parse_ncu_csv(csv_text: str) -> dict[str, Any]:
     """Parse NVIDIA Nsight Compute (`ncu --csv`) counter output into structured observations."""
     metrics: dict[str, float] = {}
-    reader = csv.DictReader(io.StringIO(csv_text.strip()))
+    kernels: set[str] = set()
+    lines = (line for line in csv_text.splitlines() if line.strip() and not line.lstrip().startswith("=="))
+    reader = csv.DictReader(lines)
     for row in reader:
+        kernel = (row.get("Kernel Name") or "").strip()
+        if kernel:
+            kernels.add(kernel)
         name = (row.get("Metric Name") or "").strip()
         val_raw = (row.get("Metric Value") or "").replace(",", "").strip()
         if not name or not val_raw:
             continue
         try:
-            metrics[name] = float(val_raw)
+            value = float(val_raw)
         except ValueError:
             continue
+        if math.isfinite(value):
+            metrics[name] = value
 
-    lmem_spill = metrics.get(
-        "lmem_spill_bytes",
-        metrics.get("smsp__sass_lmem_bytes_per_thread.sum", 0.0),
-    )
-    occupancy = metrics.get(
-        "achieved_occupancy",
-        metrics.get("sm__warps_active.avg.pct_of_peak_sustained_active", 0.0) / 100.0,
-    )
-    regs = metrics.get("launch__registers_per_thread", 0.0)
+    if len(kernels) > 1:
+        return {"kernel_names": sorted(kernels), "counters": {},
+                "error": "NCU report includes multiple kernels; per-kernel attribution is required"}
+    if not metrics:
+        return {"kernel_names": sorted(kernels), "counters": {},
+                "error": "NCU report contains no usable counters"}
+
+    spill = metrics.get("lmem_spill_bytes", metrics.get("smsp__sass_lmem_bytes_per_thread.sum"))
+    occupancy = metrics.get("achieved_occupancy")
+    occupancy_pct = metrics.get("sm__warps_active.avg.pct_of_peak_sustained_active")
+    if occupancy is None and occupancy_pct is not None:
+        occupancy = round(occupancy_pct / 100.0, 4)
     return {
-        "register_spill_detected": lmem_spill > 0.0,
+        "kernel_names": sorted(kernels),
+        "register_spill_detected": None if spill is None else spill > 0.0,
         "counters": {
-            "lmem_spill_bytes": lmem_spill,
-            "achieved_occupancy": round(occupancy, 4),
-            "registers_per_thread": regs,
             **metrics,
+            "lmem_spill_bytes": spill,
+            "achieved_occupancy": occupancy,
+            "registers_per_thread": metrics.get("launch__registers_per_thread"),
         },
     }
 

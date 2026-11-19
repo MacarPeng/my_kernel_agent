@@ -204,7 +204,9 @@ class AsyncKernelLabRunner:
                         and (
                             not rt.controller.pending_candidates
                             or rt.controller.ledger.admission_frozen
+                            or rt.controller.version_cap_reached
                         )
+                        and (rt.config.max_versions is None or rt.controller.version_cap_reached)
                         and rt.controller.global_best_version_id is not None
                         and not rt.controller.final_eval_requested
                     ):
@@ -246,6 +248,7 @@ class AsyncKernelLabRunner:
                 elif msg_kind == "judge_done":
                     j_evt, leader_deliv = payload
                     rt.deliveries_log.append(leader_deliv)
+                    rt.store.write_evidence(f"verdict-{j_evt.event_id}", leader_deliv.payload)
                     self._process_controller_event(j_evt)
                     with rt.timeline.measure("Leader", f"Review judgement {leader_deliv.receipt_id}"):
                         pause_evts = rt.leader._handle_judge_delivery(leader_deliv)
@@ -275,6 +278,10 @@ class AsyncKernelLabRunner:
         if not rt.controller.stop_reason:
             if rt.controller.final_eval_requested and not rt.controller.final_eval_completed:
                 rt.controller.stop_reason = "final_eval_incomplete"
+            elif rt.config.max_versions is not None and not rt.controller.version_cap_reached:
+                rt.controller.stop_reason = rt.controller.ledger.freeze_reason or "version_target_unreached"
+            elif rt.config.max_versions is not None and not rt.controller.final_eval_completed:
+                rt.controller.stop_reason = "no_verified_incumbent"
             else:
                 rt.controller.stop_reason = rt.controller.ledger.freeze_reason or "completed"
         rt.controller.flush_snapshot()

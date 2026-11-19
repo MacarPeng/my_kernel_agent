@@ -48,9 +48,12 @@ python3 -m kernel_agent_v1.cli compare
 python3 -m kernel_agent_v1.cli compare --json
 ```
 
-在 Colab L4 上运行真实单卡 GDN 闭环（先用种子 kernel 冒烟，再加 `--deepseek-live` 接入 DeepSeek）：
+在 Colab L4 上运行真实单卡 GDN 闭环（先安装冻结 FLA `v0.5.2` 基线，再用种子 kernel 冒烟或加 `--deepseek-live` 接入 DeepSeek）：
 
 ```bash
+# 0) 安装冻结 FLA v0.5.2 测速基线（加 --no-deps 避免覆盖 Colab 自带的 torch/triton）
+pip install --no-deps git+https://github.com/fla-org/flash-linear-attention.git@9c8e42e762fce087c27b673af4922795d9edb85e
+
 # 1) 无卡模拟干跑（使用官方 100 GDN UUID + 分层 W1..W4）
 python3 -m kernel_agent_v1.cli run --backend sim --gpu NVIDIA-L4
 
@@ -63,3 +66,10 @@ python3 -m kernel_agent_v1.cli run --backend real-gpu --gpu NVIDIA-L4 --run-dir 
 ```
 
 实卡运行时，普通任务默认超时为 1800 秒，单次诊断上限为 450 秒，并受诊断有效期约束。`--abba-retest-timeout-s` 默认 18000 秒，`--final-eval-timeout-s` 默认每个终评块 36000 秒。默认整轮墙钟和 GPU 调度预算会计入 ABBA 和三块终评的预留时间。手动指定的超时和整轮预算均按传入的秒数生效。
+
+
+### V100 长实验
+
+用 `--max-versions 100` 取代 `--max-rounds`。种子计作 V1，V100 完成对应的评测和判定后停止迭代，只对保留下来的最优版本发起一次终评。F1、F2、F3 是该次终评内部的三次测量。如果预算耗尽或候选生成中断，未到目标的运行会以非零状态退出，并在 `run_result.json` 中写明进度和原因。
+
+`run_config.json` 记录启动配置，`lifecycle.jsonl` 记录版本接纳、GPU 任务启动及终评排程，`events.jsonl` 和 `scheduler_decisions.jsonl` 记录事件和调度决定，`evidence/` 和 `packages/` 保存评测证据、判定、模型调用和候选源码。`pipeline_timeline.html` 汇总工作时间。指定版本数时自动开启模型调用日志，不记录 HTTP 鉴权头。

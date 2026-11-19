@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import math
 from typing import Any
 
 from kernel_agent_v1.clock import Clock
@@ -342,7 +343,22 @@ class Judge:
         art_id = str(p.get("artifact_id") or delivery.artifact_id or "")
         block_id = str(p.get("final_block_id") or delivery.block_id or "F1")
 
-        if p.get("status") not in (None, "completed") or ver_id != self.incumbent.version_id:
+        cases = p.get("cases") or []
+        score = p.get("geomean_speedup")
+        valid_cases = (
+            len(cases) == len(self.evaluator.expected_uuid_set)
+            and {case.get("uuid") for case in cases} == self.evaluator.expected_uuid_set
+            and all(case.get("correct") is True for case in cases)
+        )
+        if (
+            p.get("status") != "completed"
+            or ver_id != self.incumbent.version_id
+            or art_id != self.incumbent.artifact_id
+            or block_id not in self.final_eval_blocks
+            or not valid_cases
+            or not isinstance(score, (int, float))
+            or not math.isfinite(score) or score <= 0
+        ):
             return self._build_outputs(
                 delivery=delivery,
                 verdict="final_eval_failed",
@@ -353,6 +369,7 @@ class Judge:
                     "block_id": block_id,
                     "receipt_id": delivery.receipt_id,
                     "verdict": "final_eval_failed",
+                    "error": p.get("error") or "Invalid final-evaluation identity, coverage, correctness, or score",
                 },
                 extra_header={"final_eval_done": False},
             )

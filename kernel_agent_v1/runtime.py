@@ -255,6 +255,16 @@ class KernelLabRuntime:
         attempt_num = task.retry_count + 1
         handle = self.operator.start(pkg, inputs, attempt_num=attempt_num)
         self.controller.mark_gpu_dispatched(task, handle.job_id, handle.attempt_id)
+        if self.config.max_versions is not None:
+            self.store.write_evidence(f"gpu-input-{handle.job_id}", {
+                **inputs, "job_id": handle.job_id, "attempt_id": handle.attempt_id,
+            })
+        self.store.append_lifecycle({
+            "event": "gpu_job_started", "timestamp": self.clock.now_iso(),
+            "task_id": task.task_id, "job_id": handle.job_id, "attempt_id": handle.attempt_id,
+            "kind": task.kind, "version_id": task.version_id, "artifact_id": task.artifact_id,
+            "block_id": task.block_id, "timeout_s": inputs["timeout_s"],
+        })
         return handle, decision
 
     def complete_gpu_job(

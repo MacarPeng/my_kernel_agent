@@ -77,6 +77,19 @@ class RunStore:
                     out.append(json.loads(stripped))
         return out
 
+    def write_json(self, name: str, payload: dict[str, Any]) -> None:
+        path = self.root / f"{name}.json"
+        tmp_path = path.with_suffix(".json.tmp")
+        with tmp_path.open("w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, path)
+
+    def append_lifecycle(self, entry: dict[str, Any]) -> None:
+        with (self.root / "lifecycle.jsonl").open("a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
     def write_evidence(self, receipt_id: str, payload: dict[str, Any]) -> Path:
         path = self.evidence_dir / f"{receipt_id}.json"
         if path.exists():
