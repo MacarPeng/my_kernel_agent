@@ -10,7 +10,7 @@ from typing import Any, Awaitable, Callable
 from urllib.error import URLError
 
 from kernel_agent_v1.llm import LLMClient, LLMMessage, LLMResponseFormatError, _complete_json
-from kernel_agent_v1.protocol import Event, EvidenceDelivery, JobKind, TaskStatus, VersionStatus
+from kernel_agent_v1.protocol import Event, EvidenceDelivery, JobKind, ResultKind, TaskStatus, VersionStatus
 from kernel_agent_v1.runtime import KernelLabRuntime
 
 
@@ -45,9 +45,11 @@ class DualResearch:
                 runtime.clock.now_iso(),
             )
             measurement = wiki.measurements[delivery.receipt_id]
-            kinds = [JobKind.PROBE.value]
-            if self.ncu_available:
-                kinds.append(JobKind.NCU_CAPTURE.value)
+            kinds = []
+            if delivery.result_kind == ResultKind.BENCHMARK_PARTIAL.value:
+                kinds.append(JobKind.PROBE.value)
+                if self.ncu_available:
+                    kinds.append(JobKind.NCU_CAPTURE.value)
             version = controller.active_version
             deadline = (
                 version.deadline_at
@@ -122,7 +124,7 @@ class DualResearch:
                 wiki.diagnoses[receipt] = conclusion
 
             request = parsed.get("diagnostic")
-            if isinstance(request, dict):
+            if deadline is not None and kinds and isinstance(request, dict):
                 await self._request_gpu(delivery, request, kinds)
         finally:
             if isinstance(task_id, str) and task_id in self.ready:
@@ -158,8 +160,7 @@ class DualResearch:
         now = rt.clock.now()
         if deadline <= now:
             return
-        key = (version.direction_id, version.version_id, version.artifact_id, uid,
-               " ".join(question.casefold().split()))
+        key = (version.direction_id, version.version_id, version.artifact_id, uid, kind)
         if key in self.request_keys:
             return
         package_id = controller._benchmark_package_id(version.version_id, version.artifact_id)

@@ -16,6 +16,7 @@ from kernel_agent_v1.backends import SimulatedExecutionBackend
 from kernel_agent_v1.cli import main as cli_main
 from kernel_agent_v1.clock import SimClock
 from kernel_agent_v1.coder import Coder
+from kernel_agent_v1.dual_research import DualResearch
 from kernel_agent_v1.evaluator import TrustedEvaluator
 from kernel_agent_v1.gdn_gpu_runner import _run_benchmark_block
 from kernel_agent_v1.gdn_task import (
@@ -27,7 +28,7 @@ from kernel_agent_v1.gdn_task import (
 )
 from kernel_agent_v1.leader import Leader
 from kernel_agent_v1.llm import LLMResponse, ScriptedDeepSeekClient
-from kernel_agent_v1.protocol import CommandKind, EventType, TargetRef
+from kernel_agent_v1.protocol import CommandKind, EventType, EvidenceDelivery, TargetRef
 from kernel_agent_v1.store import RunStore
 from kernel_agent_v1.wiki import HardwareKnowledgePlugin, KernelWiki
 
@@ -248,6 +249,40 @@ class TestGdnAdaptation(unittest.TestCase):
                       if "Diagnosis Researcher" in call[0].content]
             self.assertEqual(sum(p["measurement"]["receipt_id"] == "receipt-0001" for p in inputs), 1)
             self.assertFalse(any(event.event == EventType.TASK_WAITING.value for _, event in store.load_events()))
+
+    def test_ncu_result_cannot_request_another_capture(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = RunStore(tmp)
+            wiki = KernelWiki()
+            delivery = EvidenceDelivery(
+                "delivery-1", "receipt-1", "diagnosis", "ncu_parsed", "operator",
+                "", "V1", "seed", "gdn", None, "W1", "", {"workload_id": "case-1"},
+            )
+            wiki.register_measurement("run", delivery)
+            runtime = SimpleNamespace(
+                wiki=wiki, store=store, clock=SimClock(),
+                config=SimpleNamespace(
+                    gpu_name="NVIDIA-L4", budgets=SimpleNamespace(total_model_budget_cost=1),
+                ),
+                controller=SimpleNamespace(
+                    ledger=SimpleNamespace(model_cost_used=0),
+                    active_version=SimpleNamespace(version_id="V1", status="active", deadline_at=6000),
+                ),
+            )
+            client = ScriptedDeepSeekClient(lambda messages: {
+                "observation": "Counters were collected.",
+                "diagnostic": {"kind": "ncu_capture", "workload_id": "case-1"},
+            })
+            async def submit_event(event):
+                self.fail(f"Unexpected event {event}")
+
+            diagnosis = DualResearch(runtime, client, submit_event, ncu_available=True)
+            with patch.object(diagnosis, "_request_gpu") as request_gpu:
+                asyncio.run(diagnosis.diagnose(runtime, delivery))
+                request_gpu.assert_not_called()
+
+            self.assertEqual(json.loads(client.calls[0][1].content)["available_diagnostics"], [])
+            self.assertIn("diagnosis-receipt-1", wiki.diagnoses)
 
     def test_benchmark_runner_reports_triton_compilation_error(self) -> None:
         triton_error = type(
