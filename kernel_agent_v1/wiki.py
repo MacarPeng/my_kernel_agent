@@ -68,7 +68,22 @@ class HardwareKnowledgePlugin:
 
     @staticmethod
     def _default_entries(gpu_arch: str, toolchain: str) -> list[KnowledgeEntry]:
-        return [
+        entries = [
+            KnowledgeEntry(
+                entry_id="hw-l4-00",
+                gpu_arch="NVIDIA-L4",
+                toolchain=toolchain,
+                topic="l4_ada_hardware_boundary",
+                source="NVIDIA L4 Datasheet & Ada Lovelace Tuning Guide",
+                scope="SM89 / 24 GB GDDR6 (~300 GB/s), 48 MB L2, 58 SMs, 100 KiB SMEM/SM",
+                version=toolchain,
+                guidance=(
+                    "NVIDIA L4 (SM89 Ada) supports BF16/TF32/FP8 Tensor Cores and SM80 cp.async "
+                    "(no TMA/WGMMA). Prioritize L2 cache reuse (48 MB) and fuse gates/epilogues "
+                    "to reduce GDDR6 traffic (~300 GB/s); keep per-CTA static SMEM <= 48 KiB."
+                ),
+                keywords=("l4", "sm89", "ada", "l2", "bandwidth", "cp.async", "gdn", "bf16"),
+            ),
             KnowledgeEntry(
                 entry_id="hw-reg-01",
                 gpu_arch="NVIDIA-H100-SXM",
@@ -182,6 +197,33 @@ class HardwareKnowledgePlugin:
                 keywords=("numerical", "precision", "fp32", "bf16", "decay", "correctness"),
             ),
         ]
+        # Load curated Ada/GDN/NCU hardware knowledge docs adapted from KernelLab assets
+        try:
+            from kernel_agent_v1.gdn_task import load_curated_knowledge_files
+
+            for doc in load_curated_knowledge_files():
+                name = doc["name"]
+                arch = (
+                    "NVIDIA-L4"
+                    if "ada" in name
+                    else ("NVIDIA-A100-SXM" if "ampere" in name else gpu_arch)
+                )
+                entries.append(
+                    KnowledgeEntry(
+                        entry_id=f"hw-doc-{name}",
+                        gpu_arch=arch,
+                        toolchain=toolchain,
+                        topic=name.replace("-", "_"),
+                        source=f"KernelLab curated knowledge ({name}.md)",
+                        scope="gdn-unified-v2 / curated hardware & profiling boundary",
+                        version=toolchain,
+                        guidance=doc["content"][:600],
+                        keywords=tuple(name.split("-")) + ("gdn", "sm89", "ncu", "register"),
+                    )
+                )
+        except Exception:
+            pass
+        return entries
 
     def add_verified_lesson(
         self,

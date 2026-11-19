@@ -53,6 +53,7 @@ class Coder:
         clock: Clock,
         wiki: KernelWiki | None = None,
         implementation_fn: Callable[[Command], dict[str, Any]] | None = None,
+        enforce_gdn_abi: bool = False,
     ) -> None:
         self.packages_dir = Path(packages_dir)
         self.packages_dir.mkdir(parents=True, exist_ok=True)
@@ -60,6 +61,7 @@ class Coder:
         self.clock = clock
         self.wiki = wiki
         self.implementation_fn = implementation_fn
+        self.enforce_gdn_abi = enforce_gdn_abi
         self._pkg_seq = 0
         self._evt_seq = 0
         self.packages: dict[str, CodePackage] = {}
@@ -134,6 +136,12 @@ class Coder:
             violations.append(
                 f"workload_ids mismatch: {workload_ids} != {constraints.workload_ids}"
             )
+
+        # 6. Optional strict GDN ABI & AST safety check (adapted from kernel_lab/tasks/gdn/solution.py)
+        if self.enforce_gdn_abi and command.head.kind == CommandKind.IMPLEMENT_KERNEL.value:
+            from kernel_agent_v1.gdn_task import validate_gdn_candidate_sources
+
+            violations.extend(validate_gdn_candidate_sources(files))
 
         return ConstraintCheckResult(
             passed=len(violations) == 0,

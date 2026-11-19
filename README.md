@@ -22,6 +22,8 @@
 | `kernel_agent_v1/llm.py` | DeepSeek LLM 接入接口（默认离线安全占位，含 `DeepSeekClient`、`ScriptedDeepSeekClient` 与 Researcher/Coder 适配器） |
 | `kernel_agent_v1/runtime.py` | `KernelLabRuntime`：串联五角色与事件循环，统计首份可行动证据、成员/GPU 重叠与吞吐指标 |
 | `kernel_agent_v1/closed_loop_tester.py` | `ClosedLoopTester`：无卡闭环验证器，支持纯模拟与真实子进程执行并自动核验 10 项闭环不变量 |
+| `kernel_agent_v1/gdn_task.py` | 复用适配自 `KernelLabPanel_20261018` 的官方 GDN Prefill 100 固定 UUID、分层 `W1..W4` 分块与 ABI/AST 校验 |
+| `kernel_agent_v1/gdn_gpu_runner.py` | 真实单卡（Colab L4 / Ada / Ampere / Hopper）GDN 评测、ABBA、终评与 `ncu --csv` 采集执行入口 |
 | `kernel_agent_v1/experiments.py` | `whole_round` / `chunked_fcfs` / `chunked_dynamic` 同协议三路基线对照 |
 
 ## 运行验证
@@ -44,4 +46,18 @@ python3 -m kernel_agent_v1.cli closed-loop --backend subprocess
 ```bash
 python3 -m kernel_agent_v1.cli compare
 python3 -m kernel_agent_v1.cli compare --json
+```
+
+在 Colab L4 上运行真实单卡 GDN 闭环（先用种子 kernel 冒烟，再加 `--deepseek-live` 接入 DeepSeek）：
+
+```bash
+# 1) 无卡模拟干跑（使用官方 100 GDN UUID + 分层 W1..W4）
+python3 -m kernel_agent_v1.cli run --backend sim --gpu NVIDIA-L4
+
+# 2) Colab L4 真卡冒烟（种子 kernel 跑通真实 CUDA Event 测速）
+python3 -m kernel_agent_v1.cli run --backend real-gpu --gpu NVIDIA-L4 --run-dir /content/drive/MyDrive/kernellab_runs/smoke1 --smoke-cases 4
+
+# 3) Colab L4 真卡 + DeepSeek 自主优化（需先设置 DEEPSEEK_API_KEY）
+export DEEPSEEK_API_KEY="sk-..."
+python3 -m kernel_agent_v1.cli run --backend real-gpu --gpu NVIDIA-L4 --run-dir /content/drive/MyDrive/kernellab_runs/run1 --deepseek-live --max-rounds 4
 ```

@@ -111,17 +111,46 @@ class TrustedEvaluator:
         total_cases: int = 100,
         num_blocks: int = 4,
         min_gain_threshold: float = 0.01,
+        uuids: tuple[str, ...] | None = None,
+        blocks: dict[str, tuple[str, ...]] | None = None,
     ) -> None:
         self.protocol = protocol
         self.device_id = device_id
-        self.uuids = generate_fixed_uuids(total_cases)
+        self.uuids = uuids if uuids is not None else generate_fixed_uuids(total_cases)
         self.expected_uuid_set = frozenset(self.uuids)
-        self.blocks = partition_blocks(self.uuids, num_blocks)
+        self.blocks = (
+            blocks if blocks is not None else partition_blocks(self.uuids, num_blocks)
+        )
         self.min_gain_threshold = min_gain_threshold
         # Frozen FLA baseline latencies (ms) deterministic per UUID
         self.frozen_baseline_ms: dict[str, float] = {
             uuid: 1.0 + (idx % 17) * 0.12 for idx, uuid in enumerate(self.uuids)
         }
+
+    @classmethod
+    def from_official_gdn_dataset(
+        cls,
+        device_id: str = "NVIDIA-L4:0",
+        min_gain_threshold: float = 0.01,
+    ) -> "TrustedEvaluator":
+        """Construct TrustedEvaluator pinned to the 100 official GDN UUIDs & stratified W1..W4."""
+        from kernel_agent_v1.gdn_task import (
+            load_official_workloads,
+            stratified_split_workblocks,
+        )
+
+        rows = load_official_workloads()
+        blocks = stratified_split_workblocks(rows)
+        uuids = tuple(uid for b in BLOCK_IDS for uid in blocks[b])
+        return cls(
+            protocol=GDN_PROTOCOL,
+            device_id=device_id,
+            total_cases=len(uuids),
+            num_blocks=len(BLOCK_IDS),
+            min_gain_threshold=min_gain_threshold,
+            uuids=uuids,
+            blocks=blocks,
+        )
 
     def verify_block(
         self,
