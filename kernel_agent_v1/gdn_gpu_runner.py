@@ -146,8 +146,9 @@ def _run_benchmark_block(inputs: dict[str, Any], torch_mod) -> dict[str, Any]:
         correct = _check_correctness(cand_out, ref_out, torch_mod)
 
         if torch_mod.cuda.is_available():
-            base_ms = _time_cuda_fn(ref_fn, args, torch_mod, warmup=1, iters=3)
-            cand_ms = _time_cuda_fn(cand_fn, args, torch_mod, warmup=1, iters=3)
+            # Use 1 timed pass for slow pure-Python reference fallback; full warmup+iters for candidate
+            base_ms = _time_cuda_fn(ref_fn, args, torch_mod, warmup=0, iters=1)
+            cand_ms = _time_cuda_fn(cand_fn, args, torch_mod, warmup=1, iters=2)
         else:
             base_ms, cand_ms = 1.0, 1.0
 

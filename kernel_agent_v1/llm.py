@@ -221,10 +221,14 @@ class DeepSeekResearcherAdapter:
         )
 
         sys_prompt = (
-            "You are a KernelLab Researcher. Separate observation, explanation, prediction, "
-            "and emit JSON with keys: observation, explanation, prediction, hypothesis, "
-            "command_kind, instruction, deliverable, allowed_paths, workload_ids, "
-            "wait_member, wait_duration_s."
+            "You are a KernelLab Researcher optimizing GDN prefill Triton/PyTorch kernels. "
+            "Separate observation, explanation, prediction, and emit valid JSON with keys: "
+            "observation, explanation, prediction, hypothesis, command_kind "
+            "(one of implement_kernel, write_ncu_capture, write_probe, write_compiler_analysis), "
+            "instruction, deliverable, allowed_paths (use ['kernel.py'] for implement_kernel), "
+            "workload_ids, preserve_target (false for implement_kernel). "
+            "For implement_kernel, kernel.py MUST define "
+            "run(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale) -> (output, new_state)."
         )
         user_payload = {
             "research_id": rid,
@@ -311,8 +315,12 @@ class DeepSeekCoderAdapter:
         self, command: Command
     ) -> tuple[Event, CodePackage | None, LLMUsage]:
         sys_prompt = (
-            "You are KernelLab Coder. Output JSON with keys: artifact_id, entrypoint, "
-            "files (dict of rel_path -> code), executable_stages. Strictly stay inside allowed_paths."
+            "You are KernelLab Coder. Output valid JSON with keys: artifact_id, entrypoint "
+            "('kernel.py' for implement_kernel), files (dict of rel_path -> complete Python code), "
+            "executable_stages. Strictly stay inside allowed_paths. Only import from "
+            "triton, torch, math, typing, functools (no os/sys/eval/open). For implement_kernel, "
+            "kernel.py MUST define run(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale) "
+            "returning (output_bf16, new_state_fp32)."
         )
         resp = await self.llm.complete(
             [

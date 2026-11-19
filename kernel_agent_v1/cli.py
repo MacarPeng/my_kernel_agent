@@ -175,6 +175,15 @@ def _run_end_to_end(args: argparse.Namespace) -> int:
         rt, hooks=AsyncRunnerHooks(on_research_evidence=_on_evidence)
     )
     metrics = asyncio.run(runner.run(max_wall_s=float(args.wall_budget_s)))
+    # Surface any job execution errors clearly in stderr for immediate diagnostics
+    for _, evt in rt.store.load_events():
+        err = evt.extra.get("error")
+        if err:
+            print(
+                f"[job-error] event={evt.event} ver={evt.version_id} block={evt.block_id} "
+                f"status={evt.status} error={str(err)[:300]}",
+                file=sys.stderr,
+            )
     print(json.dumps(metrics.to_dict(), indent=2, ensure_ascii=False))
     return 0
 

@@ -448,6 +448,12 @@ class LocalSubprocessBackend(ExecutionBackend):
             raise ValueError("LocalSubprocessBackend requires package or inputs['command']")
 
         env = os.environ.copy()
+        repo_root = str(Path(__file__).resolve().parent.parent)
+        existing_pp = env.get("PYTHONPATH", "")
+        if repo_root not in existing_pp.split(os.pathsep):
+            env["PYTHONPATH"] = (
+                f"{repo_root}{os.pathsep}{existing_pp}" if existing_pp else repo_root
+            )
         if "env" in inputs and isinstance(inputs["env"], dict):
             env.update({str(k): str(v) for k, v in inputs["env"].items()})
 
