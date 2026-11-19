@@ -526,11 +526,27 @@ class LocalSubprocessBackend(ExecutionBackend):
                 error="cancelled",
             )
 
+        return self._read_process_result(handle, proc.returncode, stderr_b, dur)
+
+    def _read_process_result(
+        self, handle: JobHandle, returncode: int, stderr_b: bytes, dur: float
+    ) -> RawOutcome:
         out_path = Path(handle.metadata["output_path"])
         payload: dict[str, Any] = {}
         if out_path.exists():
             payload = json.loads(out_path.read_text(encoding="utf-8"))
-        status = "completed" if proc.returncode == 0 else "infra_failed"
+        failure = payload.get("candidate_failure")
+        if returncode != 0:
+            status = "infra_failed"
+            error = stderr_b.decode("utf-8", errors="replace")
+        elif handle.kind == JobKind.BENCHMARK_BLOCK.value and failure in (
+            "compile_failed", "candidate_failed", "numerical_failed"
+        ):
+            status = failure
+            error = payload.get("error")
+        else:
+            status = "completed"
+            error = None
         self._processes.pop(handle.attempt_id, None)
         return RawOutcome(
             job_id=handle.job_id,
@@ -539,7 +555,7 @@ class LocalSubprocessBackend(ExecutionBackend):
             gpu_released=True,
             duration_s=dur,
             payload=payload,
-            error=stderr_b.decode("utf-8", errors="replace") if proc.returncode != 0 else None,
+            error=error,
         )
 
     def stop(self, handle: JobHandle, reason: str, clock: Clock) -> CleanupReceipt:
@@ -619,21 +635,7 @@ class LocalSubprocessBackend(ExecutionBackend):
                 error="cancelled",
             )
 
-        out_path = Path(handle.metadata["output_path"])
-        payload: dict[str, Any] = {}
-        if out_path.exists():
-            payload = json.loads(out_path.read_text(encoding="utf-8"))
-        status = "completed" if proc.returncode == 0 else "infra_failed"
-        self._processes.pop(handle.attempt_id, None)
-        return RawOutcome(
-            job_id=handle.job_id,
-            attempt_id=handle.attempt_id,
-            status=status,
-            gpu_released=True,
-            duration_s=dur,
-            payload=payload,
-            error=stderr_b.decode("utf-8", errors="replace") if proc.returncode != 0 else None,
-        )
+        return self._read_process_result(handle, proc.returncode, stderr_b, dur)
 
 
 def parse_ncu_csv(csv_text: str) -> dict[str, Any]:

@@ -258,6 +258,8 @@ class DeepSeekResearcherAdapter:
         direction_id: str,
         deliveries: list[EvidenceDelivery],
         default_target: TargetRef,
+        *,
+        repair_context: dict[str, Any] | None = None,
     ) -> tuple[Command, dict[str, Any], LLMUsage]:
         researcher = self.leader.ensure_researcher(researcher_id)
         rid = self.leader.next_research_id()
@@ -309,6 +311,13 @@ class DeepSeekResearcherAdapter:
         }
         if self.task_definition is not None:
             user_payload["task_definition"] = self.task_definition
+        if repair_context is not None:
+            user_payload["repair_context"] = repair_context
+            sys_prompt += (
+                " Diagnose the candidate failure from the evidence and source. "
+                "Explain the cause and issue an implement_kernel instruction to repair the target "
+                "while preserving the task interface."
+            )
         parsed, usage = await _complete_json(
             self.llm,
             [
@@ -346,7 +355,10 @@ class DeepSeekResearcherAdapter:
         )
 
         cmd = self.leader.build_command(
-            kind=str(parsed.get("command_kind", CommandKind.IMPLEMENT_KERNEL.value)),
+            kind=(
+                CommandKind.IMPLEMENT_KERNEL.value if repair_context is not None
+                else str(parsed.get("command_kind", CommandKind.IMPLEMENT_KERNEL.value))
+            ),
             research_id=rid,
             direction_id=direction_id,
             target=default_target,
@@ -356,8 +368,14 @@ class DeepSeekResearcherAdapter:
             deliverable=str(parsed.get("deliverable", "kernel package")),
             reply_to=researcher_id,
             workload_ids=tuple(parsed.get("workload_ids", ())),
-            allowed_paths=tuple(parsed.get("allowed_paths", ())),
-            preserve_target=bool(parsed.get("preserve_target", True)),
+            allowed_paths=(
+                tuple(repair_context["files"]) if repair_context is not None
+                else tuple(parsed.get("allowed_paths", ()))
+            ),
+            preserve_target=(
+                False if repair_context is not None
+                else bool(parsed.get("preserve_target", True))
+            ),
         )
         return cmd, parsed, usage
 
@@ -373,7 +391,7 @@ class DeepSeekCoderAdapter:
         self.task_definition = task_definition
 
     async def implement(
-        self, command: Command
+        self, command: Command, *, repair_context: dict[str, Any] | None = None
     ) -> tuple[Event, CodePackage | None, LLMUsage]:
         sys_prompt = (
             "You are KernelLab Coder. Output valid JSON with keys: artifact_id, entrypoint "
@@ -388,6 +406,12 @@ class DeepSeekCoderAdapter:
         user_payload = command.to_dict()
         if self.task_definition is not None:
             user_payload["task_definition"] = self.task_definition
+        if repair_context is not None:
+            user_payload["repair_context"] = repair_context
+            sys_prompt += (
+                " Use the failed source and diagnostic in repair_context to implement "
+                "the Leader's repair instruction. Return the complete corrected files."
+            )
         parsed, usage = await _complete_json(
             self.llm,
             [
@@ -395,5 +419,8 @@ class DeepSeekCoderAdapter:
                 LLMMessage("user", json.dumps(user_payload, ensure_ascii=False)),
             ],
         )
+        if repair_context is not None:
+            parsed.pop("package_id", None)
+            parsed.pop("artifact_id", None)
         evt, pkg = self.coder.execute_command(command, provided_spec=parsed)
         return evt, pkg, usage

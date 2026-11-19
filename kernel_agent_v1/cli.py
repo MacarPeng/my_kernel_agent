@@ -181,7 +181,26 @@ def _run_end_to_end(args: argparse.Namespace) -> int:
             ResultKind.PROBE_RESULT.value,
         ):
             return
-        if delivery.block_id and delivery.block_id != "W1":
+        status = delivery.payload.get("status")
+        repair_context = None
+        if delivery.result_kind == ResultKind.BENCHMARK_PARTIAL.value and status in (
+            "compile_failed", "candidate_failed", "numerical_failed"
+        ):
+            failed_package = runtime.packages_by_id.get(delivery.payload.get("package_id"))
+            if failed_package is None:
+                print(f"[repair] missing source for {delivery.receipt_id}", file=sys.stderr)
+                return
+            repair_context = {
+                "diagnostic": delivery.payload,
+                "gpu": runtime.config.gpu_name,
+                "files": {
+                    name: (Path(failed_package.root_dir) / name).read_text(encoding="utf-8")
+                    for name in failed_package.manifest.file_digests
+                },
+            }
+        elif status in ("infra_failed", "timed_out", "cancelled") or (
+            delivery.block_id and delivery.block_id != "W1"
+        ):
             return
         rounds_remaining[0] -= 1
         try:
@@ -189,6 +208,7 @@ def _run_end_to_end(args: argparse.Namespace) -> int:
                 researcher_id="res_main",
                 direction_id="gdn-prefill-main",
                 deliveries=[delivery],
+                repair_context=repair_context,
                 default_target=TargetRef(
                     delivery.version_id or "V1", delivery.artifact_id or "art-seed-v0"
                 ),
@@ -203,7 +223,7 @@ def _run_end_to_end(args: argparse.Namespace) -> int:
             return
         runtime.controller.ledger.model_cost_used += usage.cost_usd
         try:
-            evt, pkg, usage = await coder_adapter.implement(cmd)
+            evt, pkg, usage = await coder_adapter.implement(cmd, repair_context=repair_context)
         except LLMResponseFormatError as exc:
             usage = exc.usage
             evt, pkg = runtime.coder.execute_command(cmd, {"blocked_reason": str(exc)})

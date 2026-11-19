@@ -116,6 +116,8 @@ class Operator:
             inputs=inputs,
             clock=self.clock,
         )
+        if package is not None:
+            handle.metadata["package_id"] = package.manifest.package_id
         if resource == "gpu":
             self.active_gpu_handle = handle
         else:
@@ -283,13 +285,14 @@ class Operator:
         receipt_id: str,
         res: OperatorDispatchResult,
     ) -> OperatorDispatchResult:
-        if outcome.status in ("infra_failed", "timed_out", "cancelled", "compile_failed"):
+        candidate_failed = outcome.status in ("compile_failed", "candidate_failed", "numerical_failed")
+        if candidate_failed or outcome.status in ("infra_failed", "timed_out", "cancelled"):
             res.scheduling_events.append(
                 self._emit_gpu_or_cpu_header(
                     handle, outcome, receipt_id, ResultKind.BENCHMARK_PARTIAL.value
                 )
             )
-            if outcome.payload:
+            if outcome.payload or outcome.error or candidate_failed:
                 res.deliveries.append(
                     self._deliver(
                         receipt_id=receipt_id,
@@ -297,10 +300,11 @@ class Operator:
                         result_kind=ResultKind.BENCHMARK_PARTIAL.value,
                         handle=handle,
                         payload={
+                            **outcome.payload,
                             "receipt_id": receipt_id,
                             "status": outcome.status,
                             "error": outcome.error,
-                            **outcome.payload,
+                            "package_id": handle.metadata.get("package_id"),
                         },
                     )
                 )
@@ -326,6 +330,8 @@ class Operator:
             "protocol": outcome.payload.get("protocol", self.evaluator.protocol),
             "device_id": outcome.payload.get("device_id", self.evaluator.device_id),
             "attempt_id": handle.attempt_id,
+            "status": "completed" if block_eval.all_correct else "numerical_failed",
+            "package_id": handle.metadata.get("package_id"),
             "all_correct": block_eval.all_correct,
             "valid": block_eval.valid,
             "issues": block_eval.issues,

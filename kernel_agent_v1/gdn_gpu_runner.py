@@ -13,6 +13,7 @@ import math
 from pathlib import Path
 import subprocess
 import sys
+import traceback
 from typing import Any
 
 from kernel_agent_v1.backends import parse_ncu_csv
@@ -123,6 +124,15 @@ def _check_correctness(cand_out, ref_out, torch_mod) -> bool:
     return ok_o and ok_s
 
 
+def _candidate_failure(status: str, stage: str, error: str, workload_id: str | None = None):
+    return {
+        "candidate_failure": status,
+        "failure_stage": stage,
+        "error": error,
+        "workload_id": workload_id,
+    }
+
+
 def _run_benchmark_block(inputs: dict[str, Any], torch_mod) -> dict[str, Any]:
     defn = load_official_definition()
     rows = load_official_workloads()
@@ -139,8 +149,10 @@ def _run_benchmark_block(inputs: dict[str, Any], torch_mod) -> dict[str, Any]:
 
     ref_fn = _build_reference_fn(defn)
     cand_path = Path(inputs["candidate_path"])
-    cand_mod = _load_python_entrypoint(cand_path, "cand_kernel")
-    cand_fn = cand_mod.run
+    try:
+        cand_fn = _load_python_entrypoint(cand_path, "cand_kernel").run
+    except Exception:
+        return _candidate_failure("compile_failed", "load", traceback.format_exc())
 
     # Optional case cap for quick smoke tests (default 0 = full 25-case official block)
     max_cases = int(inputs.get("max_cases", 0))
@@ -160,14 +172,36 @@ def _run_benchmark_block(inputs: dict[str, Any], torch_mod) -> dict[str, Any]:
             e_ref.record()
             torch_mod.cuda.synchronize()
             base_ms = float(s_ref.elapsed_time(e_ref))
-            cand_out = cand_fn(*args)
-            correct = _check_correctness(cand_out, ref_out, torch_mod)
-            cand_ms = _time_cuda_fn(cand_fn, args, torch_mod, warmup=1, iters=2)
         else:
             ref_out = ref_fn(*args)
+            base_ms = 1.0
+
+        try:
             cand_out = cand_fn(*args)
             correct = _check_correctness(cand_out, ref_out, torch_mod)
-            base_ms, cand_ms = 1.0, 1.0
+            if not correct:
+                actual_shapes = [tuple(t.shape) for t in cand_out]
+                expected_shapes = [tuple(t.shape) for t in ref_out]
+                return _candidate_failure(
+                    "numerical_failed", "correctness",
+                    f"Output/state comparison failed; candidate shapes {actual_shapes}, "
+                    f"reference shapes {expected_shapes}.",
+                    uid,
+                )
+            cand_ms = (
+                _time_cuda_fn(cand_fn, args, torch_mod, warmup=1, iters=2)
+                if torch_mod.cuda.is_available() else 1.0
+            )
+        except Exception as exc:
+            is_compile_error = any(
+                cls.__module__.startswith("triton.compiler.") for cls in type(exc).__mro__
+            )
+            return _candidate_failure(
+                "compile_failed" if is_compile_error else "candidate_failed",
+                "compile" if is_compile_error else "execution",
+                traceback.format_exc(),
+                uid,
+            )
 
         cases.append(
             {

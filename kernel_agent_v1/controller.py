@@ -503,6 +503,7 @@ class Controller:
 
         if event.status in (
             "compile_failed",
+            "candidate_failed",
             "numerical_failed",
             "infra_failed",
             "timed_out",

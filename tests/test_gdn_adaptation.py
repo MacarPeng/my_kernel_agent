@@ -7,6 +7,7 @@ from io import StringIO
 import json
 from pathlib import Path
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -15,6 +16,7 @@ from kernel_agent_v1.cli import main as cli_main
 from kernel_agent_v1.clock import SimClock
 from kernel_agent_v1.coder import Coder
 from kernel_agent_v1.evaluator import TrustedEvaluator
+from kernel_agent_v1.gdn_gpu_runner import _run_benchmark_block
 from kernel_agent_v1.gdn_task import (
     load_official_definition,
     load_official_workloads,
@@ -146,6 +148,69 @@ class TestGdnAdaptation(unittest.TestCase):
                 blocks = {t["block_id"]: t["timeout_s"] for t in tasks if t["kind"] == "final_eval"}
                 self.assertEqual(blocks, {"F1": final_timeout, "F2": final_timeout, "F3": final_timeout})
                 self.assertEqual({t["timeout_s"] for t in tasks if t["kind"] == "benchmark_block"}, {180.0})
+
+    def test_benchmark_runner_reports_triton_compilation_error(self) -> None:
+        triton_error = type(
+            "UnsupportedLanguageConstruct", (Exception,), {"__module__": "triton.compiler.errors"}
+        )
+
+        def candidate():
+            raise triton_error("unsupported AST node type: Break")
+
+        torch = SimpleNamespace(cuda=SimpleNamespace(is_available=lambda: False))
+        with patch("kernel_agent_v1.gdn_gpu_runner._build_reference_fn", return_value=lambda: ()), \
+             patch("kernel_agent_v1.gdn_gpu_runner._make_deterministic_gdn_inputs", return_value=()), \
+             patch("kernel_agent_v1.gdn_gpu_runner._load_python_entrypoint",
+                   return_value=SimpleNamespace(run=candidate)):
+            result = _run_benchmark_block({
+                "attempt_id": "job-1/1", "candidate_path": "kernel.py", "block_id": "W1",
+            }, torch)
+
+        self.assertEqual(result["candidate_failure"], "compile_failed")
+        self.assertEqual(result["failure_stage"], "compile")
+        self.assertTrue(result["workload_id"])
+        self.assertIn("unsupported AST node type: Break", result["error"])
+
+    def test_candidate_compile_failure_reaches_leader_and_coder(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            backend = SimulatedExecutionBackend(TrustedEvaluator.from_official_gdn_dataset())
+            backend.set_behavior("art-seed-v0:benchmark_block:W1", {
+                "compile_fail": True, "error": "unsupported AST node type: Break",
+            })
+            source = seed_gdn_candidate_source()
+            replies = iter([
+                {"explanation": "Triton rejects break", "instruction": "Use a bounded loop"},
+                {"artifact_id": "art-seed-v0", "package_id": "pkg-0001",
+                 "entrypoint": "kernel.py", "files": {"kernel.py": source + "\n# bounded loop\n"}},
+            ])
+            client = ScriptedDeepSeekClient(lambda messages: next(replies))
+            with patch("kernel_agent_v1.cli.SimulatedExecutionBackend", return_value=backend), \
+                 patch("kernel_agent_v1.cli.DeepSeekClient", return_value=client), \
+                 redirect_stdout(StringIO()), redirect_stderr(StringIO()):
+                self.assertEqual(cli_main([
+                    "run", "--deepseek-live", "--max-rounds", "1", "--run-dir", tmp,
+                ]), 0)
+
+            leader_call, coder_call = (json.loads(call[-1].content) for call in client.calls)
+            context = leader_call["repair_context"]
+            self.assertEqual(context["files"]["kernel.py"], source)
+            self.assertIn("unsupported AST node type: Break", context["diagnostic"]["compiler_stderr"])
+            self.assertEqual(coder_call["repair_context"], context)
+            self.assertEqual(coder_call["body"]["instruction"], "Use a bounded loop")
+
+            events = [event for _, event in RunStore(tmp).load_events()]
+            failed = [event for event in events if event.status == "compile_failed"]
+            self.assertEqual(len(failed), 1)
+            self.assertTrue(failed[0].attempt_id.endswith("/1"))
+            repaired = [event for event in events if event.event == EventType.CODE_READY.value][-1]
+            self.assertEqual(repaired.parent_version_id, failed[0].version_id)
+            self.assertNotEqual(repaired.artifact_id, failed[0].artifact_id)
+            self.assertNotEqual(repaired.extra["package_id"], context["diagnostic"]["package_id"])
+            self.assertTrue(any(
+                event.event == EventType.GPU_JOB_FINISHED.value
+                and event.artifact_id == repaired.artifact_id
+                and event.status == "completed" for event in events
+            ))
 
     def test_invalid_model_replies_allow_seed_evaluation_to_finish(self) -> None:
         plan = {"allowed_paths": ["kernel.py"], "preserve_target": False}
