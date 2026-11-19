@@ -252,6 +252,7 @@ class Controller:
             "direction_id": event.direction_id,
             "active": True,
             "registered_at": event.sim_time,
+            "deadline_s": x.get("deadline_s"),
         }
 
     def _on_priority_changed(self, event: Event) -> None:
@@ -662,6 +663,7 @@ class Controller:
                 package_id=self._benchmark_package_id(v.version_id, v.artifact_id),
                 is_required=True,
                 priority=v.priority + 100.0,
+                timeout_s=self.config.budgets.abba_retest_job_timeout_s,
                 reply_to="judge",
                 ready_at=event.sim_time,
                 metadata={

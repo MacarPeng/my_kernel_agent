@@ -11,6 +11,7 @@ from kernel_agent_v1.protocol import (
     Event,
     EvidenceDelivery,
     JobKind,
+    ResultKind,
     TaskSpec,
 )
 from kernel_agent_v1.runtime import (
@@ -29,6 +30,9 @@ class AsyncRunnerHooks:
         [KernelLabRuntime, EvidenceDelivery], Awaitable[None]
     ] | None = None
     on_idle_check: Callable[[KernelLabRuntime], Awaitable[bool]] | None = None
+    on_diagnosis_evidence: Callable[
+        [KernelLabRuntime, EvidenceDelivery], Awaitable[None]
+    ] | None = None
 
 
 class AsyncKernelLabRunner:
@@ -43,6 +47,7 @@ class AsyncKernelLabRunner:
         self.hooks = hooks or AsyncRunnerHooks()
         self._event_queue: asyncio.Queue[tuple[str, Any]] | None = None
         self._inflight_bg_tasks: set[asyncio.Task[Any]] = set()
+        self._diagnosis_tasks: set[asyncio.Task[Any]] = set()
         self._gpu_task: asyncio.Task[None] | None = None
 
     def _spawn_bg(self, coro: Awaitable[Any]) -> asyncio.Task[Any]:
@@ -51,11 +56,20 @@ class AsyncKernelLabRunner:
         task.add_done_callback(self._inflight_bg_tasks.discard)
         return task
 
+    def _spawn_diagnosis(self, delivery: EvidenceDelivery) -> None:
+        task = self._spawn_bg(self._run_diagnosis(delivery))
+        self._diagnosis_tasks.add(task)
+        task.add_done_callback(self._diagnosis_tasks.discard)
+
     async def _run_gpu_handle(self, handle: JobHandle) -> None:
         rt = self.runtime
         assert self._event_queue is not None
         try:
-            outcome = await rt.backend.async_wait(handle, rt.clock)
+            job_label = " ".join(filter(None, (handle.kind, handle.version_id, handle.block_id)))
+            activity = f"GPU {job_label} ({handle.attempt_id})"
+            with rt.timeline.measure("Operator", activity, start_s=handle.started_at) as span:
+                outcome = await rt.backend.async_wait(handle, rt.clock)
+                span.status = outcome.status
             end_t = rt.clock.now()
             rt.gpu_intervals.append((handle.started_at, end_t))
             op_res = rt.operator.finalize_handle(handle, outcome=outcome)
@@ -69,11 +83,28 @@ class AsyncKernelLabRunner:
         try:
             ch = rt.operator.start(None, cpu_inputs)
             start_t = rt.clock.now()
-            outcome = await rt.backend.async_wait(ch, rt.clock)
+            with rt.timeline.measure(
+                "Operator", f"CPU {ch.kind} ({ch.job_id})", start_s=ch.started_at
+            ) as span:
+                outcome = await rt.backend.async_wait(ch, rt.clock)
+                span.status = outcome.status
             end_t = rt.clock.now()
             rt.non_gpu_intervals.append((start_t, end_t))
             op_res = rt.operator.finalize_handle(ch, outcome=outcome)
             await self._event_queue.put(("cpu_result", op_res))
+        except Exception as exc:
+            await self._event_queue.put(("bg_error", exc))
+
+    async def _run_diagnosis(self, delivery: EvidenceDelivery) -> None:
+        rt = self.runtime
+        hook = self.hooks.on_diagnosis_evidence
+        assert self._event_queue is not None and hook is not None
+        start = rt.clock.now()
+        try:
+            with rt.timeline.measure("Diagnosis", f"Analyze {delivery.receipt_id}"):
+                await hook(rt, delivery)
+            rt.non_gpu_intervals.append((start, rt.clock.now()))
+            await self._event_queue.put(("research_done", delivery.delivery_id))
         except Exception as exc:
             await self._event_queue.put(("bg_error", exc))
 
@@ -83,13 +114,33 @@ class AsyncKernelLabRunner:
         try:
             start_t = rt.clock.now()
             if delivery.recipient == "judge":
-                j_evt, leader_deliv = rt.judge.adjudicate(delivery)
+                with rt.timeline.measure("Judge", f"Adjudicate {delivery.receipt_id}"):
+                    j_evt, leader_deliv = rt.judge.adjudicate(delivery)
                 end_t = rt.clock.now()
                 rt.non_gpu_intervals.append((start_t, end_t))
                 await self._event_queue.put(("judge_done", (j_evt, leader_deliv)))
                 return
 
-            rt.leader.deliver_evidence(delivery)
+            if self.hooks.on_diagnosis_evidence is not None:
+                if not rt.wiki.register_measurement(rt.config.run_id, delivery):
+                    return
+                rt.store.write_evidence(
+                    f"wiki-{delivery.receipt_id}", rt.wiki.measurements[delivery.receipt_id]
+                )
+                if delivery.recipient == "diagnosis":
+                    with rt.timeline.measure("Leader", f"Route {delivery.receipt_id}"):
+                        rt.leader.deliver_evidence(delivery)
+                    self._spawn_diagnosis(delivery)
+                    return
+                if (
+                    delivery.result_kind == ResultKind.BENCHMARK_PARTIAL.value
+                    and delivery.payload.get("all_correct")
+                    and delivery.payload.get("valid")
+                ):
+                    self._spawn_diagnosis(delivery)
+
+            with rt.timeline.measure("Leader", f"Receive {delivery.receipt_id}"):
+                rt.leader.deliver_evidence(delivery)
             if rt.first_actionable_evidence_s is None:
                 rt.first_actionable_evidence_s = rt.clock.now()
             if self.hooks.on_research_evidence is not None:
@@ -111,11 +162,17 @@ class AsyncKernelLabRunner:
         rt = self.runtime
         if rt.controller.gpu_busy or not rt.controller.gpu_cleanup_confirmed:
             return False
-        handle, _ = rt.dispatch_gpu_if_ready()
+        with rt.timeline.measure("Controller", "Schedule or dispatch GPU job"):
+            handle, _ = rt.dispatch_gpu_if_ready()
         if handle is None:
             return False
         self._gpu_task = asyncio.create_task(self._run_gpu_handle(handle))
         return True
+
+    def _process_controller_event(self, event: Event) -> None:
+        rt = self.runtime
+        with rt.timeline.measure("Controller", f"{event.event} ({event.event_id})"):
+            rt.controller.process_event(event)
 
     async def run(self, max_wall_s: float | None = None) -> RunMetrics:
         """Run concurrent GPU + CPU + Agent event loop until all work completes or budget ends."""
@@ -139,7 +196,7 @@ class AsyncKernelLabRunner:
                 if (
                     not rt.controller.gpu_busy
                     and self._gpu_task is None
-                    and not self._inflight_bg_tasks
+                    and not (self._inflight_bg_tasks - self._diagnosis_tasks)
                     and self._event_queue.empty()
                 ):
                     if (
@@ -151,7 +208,8 @@ class AsyncKernelLabRunner:
                         and rt.controller.global_best_version_id is not None
                         and not rt.controller.final_eval_requested
                     ):
-                        rt.controller.schedule_final_eval()
+                        with rt.timeline.measure("Controller", "Schedule final evaluation"):
+                            rt.controller.schedule_final_eval()
                         if self._try_dispatch_gpu():
                             continue
 
@@ -161,7 +219,7 @@ class AsyncKernelLabRunner:
                             self._try_dispatch_gpu()
                             continue
 
-                    if not self._try_dispatch_gpu():
+                    if not self._try_dispatch_gpu() and not self._diagnosis_tasks:
                         break
 
                 try:
@@ -174,12 +232,12 @@ class AsyncKernelLabRunner:
                 if msg_kind == "bg_error":
                     raise payload
                 elif msg_kind == "event":
-                    rt.controller.process_event(payload)
+                    self._process_controller_event(payload)
                 elif msg_kind in ("gpu_result", "cpu_result"):
                     if msg_kind == "gpu_result":
                         self._gpu_task = None
                     for evt in payload.scheduling_events:
-                        rt.controller.process_event(evt)
+                        self._process_controller_event(evt)
                     for cpu_job in payload.pending_cpu_jobs:
                         self._spawn_bg(self._run_cpu_job(cpu_job))
                     for deliv in payload.deliveries:
@@ -188,21 +246,29 @@ class AsyncKernelLabRunner:
                 elif msg_kind == "judge_done":
                     j_evt, leader_deliv = payload
                     rt.deliveries_log.append(leader_deliv)
-                    rt.controller.process_event(j_evt)
-                    pause_evts = rt.leader._handle_judge_delivery(leader_deliv)
+                    self._process_controller_event(j_evt)
+                    with rt.timeline.measure("Leader", f"Review judgement {leader_deliv.receipt_id}"):
+                        pause_evts = rt.leader._handle_judge_delivery(leader_deliv)
                     for pe in pause_evts:
-                        rt.controller.process_event(pe)
+                        self._process_controller_event(pe)
                     rt.leader.judge_deliveries.append(leader_deliv)
+                    if self.hooks.on_diagnosis_evidence is not None and leader_deliv.direction_id:
+                        researcher_id = rt.leader.direction_researcher.get(leader_deliv.direction_id)
+                        if researcher_id:
+                            rt.leader.ensure_researcher(researcher_id).receive_evidence(leader_deliv)
                 elif msg_kind == "research_done":
                     pass
 
                 self._try_dispatch_gpu()
         finally:
-            if self._gpu_task is not None and not self._gpu_task.done():
-                self._gpu_task.cancel()
-            for bg in list(self._inflight_bg_tasks):
-                if not bg.done():
-                    bg.cancel()
+            tasks = list(self._inflight_bg_tasks)
+            if self._gpu_task is not None:
+                tasks.append(self._gpu_task)
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
             self._gpu_task = None
 
         rt.controller.run_finished = True

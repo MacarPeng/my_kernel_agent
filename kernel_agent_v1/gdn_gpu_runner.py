@@ -142,6 +142,11 @@ def _run_benchmark_block(inputs: dict[str, Any], torch_mod) -> dict[str, Any]:
     block_id = str(inputs.get("block_id", "W1"))
     attempt_id = inputs["attempt_id"]
     uuids = blocks[block_id]
+    if inputs.get("kind") == "probe" and inputs.get("workload_id"):
+        workload_id = inputs["workload_id"]
+        if workload_id not in uuids:
+            raise ValueError(f"Probe workload {workload_id} outside {block_id}")
+        uuids = (workload_id,)
     device = "cuda:0" if torch_mod.cuda.is_available() else "cpu"
     device_name = (
         f"{torch_mod.cuda.get_device_name(0)}:0" if torch_mod.cuda.is_available() else "cpu:0"
@@ -234,14 +239,20 @@ def _run_ncu_capture(inputs: dict[str, Any]) -> dict[str, Any]:
         f"import torch; from pathlib import Path; "
         f"from kernel_agent_v1.gdn_gpu_runner import _load_python_entrypoint, _make_deterministic_gdn_inputs; "
         f"from kernel_agent_v1.gdn_task import load_official_workloads; "
-        f"row = load_official_workloads()[0]; "
+        f"rows = load_official_workloads(); "
+        f"uid = {inputs.get('workload_id')!r}; "
+        f"row = rows[0] if uid is None else next(r for r in rows if r['uuid'] == uid); "
         f"args = _make_deterministic_gdn_inputs(row, torch, 'cuda:0'); "
         f"mod = _load_python_entrypoint(Path({str(cand_path)!r}), 'ncu_cand'); "
-        f"mod.run(*args); torch.cuda.synchronize()"
+        f"mod.run(*args); torch.cuda.synchronize(); "
+        f"torch.cuda.cudart().cudaProfilerStart(); mod.run(*args); "
+        f"torch.cuda.synchronize(); torch.cuda.cudart().cudaProfilerStop()"
     )
     cmd = [
         "ncu",
         "--csv",
+        "--profile-from-start",
+        "off",
         "--metrics",
         "launch__registers_per_thread,smsp__sass_lmem_bytes_per_thread.sum,sm__warps_active.avg.pct_of_peak_sustained_active",
         "--launch-count",
@@ -260,15 +271,20 @@ def _run_ncu_capture(inputs: dict[str, Any]) -> dict[str, Any]:
                 "raw_counters": {},
             }
         }
-    parsed = parse_ncu_csv(proc.stdout)
-    return {
-        "raw_ncu_report": {
-            "version_id": inputs.get("version_id"),
-            "artifact_id": inputs.get("artifact_id"),
-            "raw_counters": parsed["counters"],
-            "register_spill_detected": parsed["register_spill_detected"],
-        }
-    }
+    return {"raw_ncu_report": {"csv": proc.stdout}}
+
+
+def _parse_ncu_report(inputs: dict[str, Any]) -> dict[str, Any]:
+    raw = inputs["raw_ncu_report"]
+    if raw.get("error"):
+        return {"observations": {"error": raw["error"]}}
+    if "csv" in raw:
+        observations = parse_ncu_csv(raw["csv"])
+    else:
+        observations = dict(raw)
+    if not observations.get("counters", observations.get("raw_counters")):
+        observations["error"] = "NCU report contains no usable counters"
+    return {"observations": observations}
 
 
 def _run_abba_retest(inputs: dict[str, Any], torch_mod) -> dict[str, Any]:
@@ -377,6 +393,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if kind == "ncu_capture":
         out = _run_ncu_capture(inp)
+    elif kind == "ncu_parse":
+        out = _parse_ncu_report(inp)
     else:
         import torch  # Imported lazily so CPU-only hosts don't require torch at import time
 

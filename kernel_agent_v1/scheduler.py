@@ -197,20 +197,27 @@ class DynamicScheduler:
 
             if not t.is_required:
                 diag_gpu_s, _ = self.estimate_task_duration(t, use_slow=True)
+                useful_until = t.metadata.get("useful_until_s")
+                if useful_until is not None and now + diag_gpu_s > useful_until:
+                    excluded[t.task_id] = "diagnostic_usefulness_deadline"
+                    continue
                 if v.diag_spent_s + diag_gpu_s > v.diag_budget_s:
                     excluded[t.task_id] = "version_diag_budget_exceeded"
                     continue
                 rem_blocks = len(set(v.required_blocks) - set(v.completed_blocks))
-                reserved_needed = rem_blocks * b.reserve_required_block_s + (
+                benchmark_reserve = rem_blocks * b.reserve_required_block_s
+                reserved_needed = benchmark_reserve + (
                     b.reserve_retest_s if v.conditional_retest_registered else 0.0
                 )
+                if useful_until is not None:
+                    reserved_needed += b.reserve_final_eval_s
                 if (
                     diag_gpu_s + reserved_needed > gpu_rem
                     or diag_gpu_s + reserved_needed > wall_rem
                 ):
                     excluded[t.task_id] = "insufficient_budget_for_required_eval"
                     continue
-                if now + diag_gpu_s + reserved_needed > v.deadline_at:
+                if now + diag_gpu_s + benchmark_reserve > v.deadline_at:
                     excluded[t.task_id] = "would_exceed_version_deadline"
                     continue
 
@@ -316,8 +323,11 @@ class DynamicScheduler:
         for rel in waiting_relations.values():
             if not rel.get("active"):
                 continue
+            deadline = rel.get("deadline_s")
+            if deadline is not None and deadline <= now:
+                continue
             wf = rel["waiting_for"]
-            if wf not in token_ready_at:
+            if wf not in token_ready_at or (deadline is not None and token_ready_at[wf] > deadline):
                 continue
             member_tasks.append(
                 (rel["member"], token_ready_at[wf], float(rel["estimated_duration_s"]))

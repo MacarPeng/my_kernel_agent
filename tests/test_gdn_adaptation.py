@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
+import asyncio
 import json
 from pathlib import Path
 import tempfile
@@ -25,10 +26,18 @@ from kernel_agent_v1.gdn_task import (
     validate_gdn_candidate_sources,
 )
 from kernel_agent_v1.leader import Leader
-from kernel_agent_v1.llm import ScriptedDeepSeekClient
+from kernel_agent_v1.llm import LLMResponse, ScriptedDeepSeekClient
 from kernel_agent_v1.protocol import CommandKind, EventType, TargetRef
 from kernel_agent_v1.store import RunStore
 from kernel_agent_v1.wiki import HardwareKnowledgePlugin, KernelWiki
+
+
+class TimedBackend(SimulatedExecutionBackend):
+    async def async_wait(self, handle, clock, poll_interval_s=0.01):
+        clock.advance_to(min(handle.expected_finish_at, handle.timeout_at))
+        if handle.expected_finish_at > handle.timeout_at:
+            handle.metadata["behavior"]["timeout"] = True
+        return self.wait(handle, clock)
 
 
 class TestGdnAdaptation(unittest.TestCase):
@@ -113,13 +122,6 @@ class TestGdnAdaptation(unittest.TestCase):
             self.assertEqual(rc, 0)
 
     def test_real_gpu_cli_reserves_time_for_three_long_final_blocks(self) -> None:
-        class TimedBackend(SimulatedExecutionBackend):
-            async def async_wait(self, handle, clock, poll_interval_s=0.01):
-                clock.advance_to(min(handle.expected_finish_at, handle.timeout_at))
-                if handle.expected_finish_at > handle.timeout_at:
-                    handle.metadata["behavior"]["timeout"] = True
-                return self.wait(handle, clock)
-
         for timeout_override, final_timeout in ((None, 3600), (3000, 3000), (2000, 2000)):
             with self.subTest(final_timeout=final_timeout), tempfile.TemporaryDirectory() as tmp:
                 evaluator = TrustedEvaluator.from_official_gdn_dataset()
@@ -148,6 +150,104 @@ class TestGdnAdaptation(unittest.TestCase):
                 blocks = {t["block_id"]: t["timeout_s"] for t in tasks if t["kind"] == "final_eval"}
                 self.assertEqual(blocks, {"F1": final_timeout, "F2": final_timeout, "F3": final_timeout})
                 self.assertEqual({t["timeout_s"] for t in tasks if t["kind"] == "benchmark_block"}, {180.0})
+
+    def test_real_gpu_cli_allows_long_abba_before_final_evaluation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            backend = TimedBackend(TrustedEvaluator.from_official_gdn_dataset())
+            backend.set_behavior("benchmark_block", {"duration_s": 40.0, "speedup": 1.2})
+            backend.set_behavior("improved:benchmark_block", {"duration_s": 40.0, "speedup": 2.0})
+            backend.set_behavior("abba_retest", {"duration_s": 1050.0, "speedup": 2.0})
+            replies = iter([
+                {"allowed_paths": ["kernel.py"], "preserve_target": False},
+                {"artifact_id": "improved", "entrypoint": "kernel.py",
+                 "files": {"kernel.py": seed_gdn_candidate_source() + "\n# optimized\n"}},
+            ])
+            client = ScriptedDeepSeekClient(lambda messages: next(replies))
+            stdout = StringIO()
+            with patch("kernel_agent_v1.cli.RealClock", return_value=SimClock()), \
+                 patch("kernel_agent_v1.cli.RealSingleGpuBackend", return_value=backend), \
+                 patch("kernel_agent_v1.cli.DeepSeekClient", return_value=client), \
+                 redirect_stdout(stdout):
+                self.assertEqual(cli_main([
+                    "run", "--backend", "real-gpu", "--deepseek-live",
+                    "--max-rounds", "1", "--run-dir", tmp,
+                ]), 0)
+            result = json.loads(stdout.getvalue())
+            self.assertEqual(result["best_artifact_id"], "improved")
+            self.assertEqual(result["verification_level"], "final_verified")
+            tasks = RunStore(tmp).load_snapshot()["tasks"].values()
+            self.assertEqual(
+                [t["timeout_s"] for t in tasks if t["kind"] == "abba_retest"], [1800.0]
+            )
+
+    def test_dual_researcher_uses_diagnosis_available_before_command(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = RunStore(tmp)
+
+            class CoordinatedClient(ScriptedDeepSeekClient):
+                def __init__(self):
+                    super().__init__(lambda _messages: {})
+                    self.design_started = None
+                    self.diagnosis_returning = None
+                    self.coder_input = None
+
+                async def complete(self, messages, *, json_mode=True):
+                    if self.design_started is None:
+                        self.design_started = asyncio.Event()
+                        self.diagnosis_returning = asyncio.Event()
+                    system, user = messages
+                    request = json.loads(user.content)
+                    self.calls.append(messages)
+                    if "Diagnosis Researcher" in system.content:
+                        measurement = request["measurement"]
+                        receipt = measurement["receipt_id"]
+                        assert store.read_evidence(f"wiki-{receipt}") == measurement
+                        if receipt == "receipt-0001":
+                            await self.design_started.wait()
+                            self.diagnosis_returning.set()
+                            return LLMResponse(json.dumps({
+                                "observation": "Short input latency is high.",
+                                "design_impact": "Use a short-input tile.",
+                            }), "scripted")
+                        return LLMResponse("{}", "scripted")
+                    if "Design Researcher" in system.content:
+                        assert store.read_evidence("wiki-receipt-0001")
+                        assert not request["available_diagnoses"]
+                        self.design_started.set()
+                        await self.diagnosis_returning.wait()
+                        return LLMResponse(json.dumps({
+                            "instruction": "Use a large tile.",
+                            "allowed_paths": ["kernel.py"], "preserve_target": False,
+                        }), "scripted")
+                    if "Review the proposed kernel design" in system.content:
+                        return LLMResponse(json.dumps({
+                            "instruction": "Use a short-input tile.",
+                            "diagnosis_refs": ["diagnosis-receipt-0001"],
+                        }), "scripted")
+                    self.coder_input = request
+                    return LLMResponse(json.dumps({
+                        "artifact_id": "short-tile", "entrypoint": "kernel.py",
+                        "files": {"kernel.py": seed_gdn_candidate_source() + "\n# short tile\n"},
+                    }), "scripted")
+
+            client = CoordinatedClient()
+            stdout = StringIO()
+            with patch("kernel_agent_v1.cli.DeepSeekClient", return_value=client), redirect_stdout(stdout):
+                self.assertEqual(cli_main([
+                    "run", "--deepseek-live", "--dual-researcher",
+                    "--max-rounds", "1", "--run-dir", tmp,
+                ]), 0)
+            body = client.coder_input["body"]
+            self.assertEqual(body["instruction"], "Use a short-input tile.")
+            self.assertIn("diagnosis-receipt-0001", body["evidence_refs"])
+            trace = store.read_evidence("design-" + client.coder_input["head"]["command_id"])
+            self.assertTrue(trace["late_diagnosis_changed_instruction"])
+            self.assertEqual(trace["ready_before_command"], ["diagnosis-receipt-0001"])
+            self.assertEqual(json.loads(stdout.getvalue())["diagnosis"]["conclusions"], 1)
+            inputs = [json.loads(call[1].content) for call in client.calls
+                      if "Diagnosis Researcher" in call[0].content]
+            self.assertEqual(sum(p["measurement"]["receipt_id"] == "receipt-0001" for p in inputs), 1)
+            self.assertFalse(any(event.event == EventType.TASK_WAITING.value for _, event in store.load_events()))
 
     def test_benchmark_runner_reports_triton_compilation_error(self) -> None:
         triton_error = type(
@@ -184,12 +284,21 @@ class TestGdnAdaptation(unittest.TestCase):
                  "entrypoint": "kernel.py", "files": {"kernel.py": source + "\n# bounded loop\n"}},
             ])
             client = ScriptedDeepSeekClient(lambda messages: next(replies))
+            stdout = StringIO()
             with patch("kernel_agent_v1.cli.SimulatedExecutionBackend", return_value=backend), \
                  patch("kernel_agent_v1.cli.DeepSeekClient", return_value=client), \
-                 redirect_stdout(StringIO()), redirect_stderr(StringIO()):
+                 redirect_stdout(stdout), redirect_stderr(StringIO()):
                 self.assertEqual(cli_main([
                     "run", "--deepseek-live", "--max-rounds", "1", "--run-dir", tmp,
                 ]), 0)
+
+            result = json.loads(stdout.getvalue())
+            self.assertEqual(set(result["role_active_s"]), {
+                "Controller", "Leader", "Coder", "Operator", "Judge",
+            })
+            timeline = Path(result["pipeline_timeline"]).read_text(encoding="utf-8")
+            for label in ("Plan from receipt-", "Implement cmd-", "GPU benchmark_block V1 W1", "compile_failed"):
+                self.assertIn(label, timeline)
 
             leader_call, coder_call = (json.loads(call[-1].content) for call in client.calls)
             context = leader_call["repair_context"]

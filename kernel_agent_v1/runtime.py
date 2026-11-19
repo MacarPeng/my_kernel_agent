@@ -30,6 +30,7 @@ from kernel_agent_v1.protocol import (
     VerificationLevel,
 )
 from kernel_agent_v1.store import RunStore
+from kernel_agent_v1.timeline import PipelineTimeline
 from kernel_agent_v1.wiki import HardwareKnowledgePlugin, KernelWiki
 
 
@@ -119,6 +120,7 @@ class KernelLabRuntime:
         self.config = config or RuntimeConfig()
         self.clock = clock or SimClock()
         self.store = RunStore(run_dir)
+        self.timeline = PipelineTimeline(self.clock)
         self.evaluator = TrustedEvaluator(
             protocol=self.config.protocol_name,
             device_id=f"{self.config.gpu_name}:0",
@@ -245,6 +247,10 @@ class KernelLabRuntime:
         }
         if extra_inputs_fn is not None:
             inputs.update(extra_inputs_fn(task))
+
+        useful_until = task.metadata.get("useful_until_s")
+        if useful_until is not None:
+            inputs["timeout_s"] = min(inputs["timeout_s"], useful_until - self.clock.now())
 
         attempt_num = task.retry_count + 1
         handle = self.operator.start(pkg, inputs, attempt_num=attempt_num)

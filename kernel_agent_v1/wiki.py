@@ -6,7 +6,7 @@ from dataclasses import asdict, dataclass, field
 import re
 from typing import Any
 
-from kernel_agent_v1.protocol import RouteStatus
+from kernel_agent_v1.protocol import EvidenceDelivery, RouteStatus
 
 
 def _normalize_hypothesis(text: str) -> str:
@@ -588,6 +588,30 @@ class KernelWiki:
         self.route_tree = route_tree or ExperimentRouteTree()
         self._lookup_counter = 0
         self.valid_lookups: dict[str, WikiLookupResult] = {}
+        self.measurements: dict[str, dict[str, Any]] = {}
+        self.diagnoses: dict[str, dict[str, Any]] = {}
+
+    def register_measurement(self, run_id: str, delivery: EvidenceDelivery) -> bool:
+        """Index the trusted receipt before any researcher is notified."""
+        if delivery.receipt_id in self.measurements:
+            return False
+        workload_ids = [case["uuid"] for case in delivery.payload.get("cases", [])]
+        if not workload_ids and delivery.payload.get("workload_id"):
+            workload_ids = [delivery.payload["workload_id"]]
+        if not workload_ids:
+            workload_ids = delivery.payload.get("workloads") or []
+        self.measurements[delivery.receipt_id] = {
+            "run_id": run_id,
+            "receipt_id": delivery.receipt_id,
+            "direction_id": delivery.direction_id,
+            "version_id": delivery.version_id,
+            "artifact_id": delivery.artifact_id,
+            "block_id": delivery.block_id,
+            "workload_ids": workload_ids,
+            "kind": delivery.result_kind,
+            "evidence_path": delivery.evidence_path,
+        }
+        return True
 
     def query(
         self,

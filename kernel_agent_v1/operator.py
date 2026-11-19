@@ -116,6 +116,7 @@ class Operator:
             inputs=inputs,
             clock=self.clock,
         )
+        handle.metadata.setdefault("inputs", dict(inputs))
         if package is not None:
             handle.metadata["package_id"] = package.manifest.package_id
         if resource == "gpu":
@@ -450,11 +451,14 @@ class Operator:
             "error": outcome.error,
             **outcome.payload,
         }
+        inputs = handle.metadata.get("inputs", {})
+        if handle.reply_to == "diagnosis":
+            raw_payload["workload_id"] = inputs.get("workload_id")
+            raw_payload["diagnostic_task_id"] = handle.task_id
         self.store.write_evidence(receipt_id, raw_payload)
 
         if outcome.status == "completed":
             # Schedule follow-up CPU parse job off-GPU
-            inputs = handle.metadata.get("inputs", {})
             res.pending_cpu_jobs.append(
                 {
                     "task_id": f"{handle.task_id}__parse",
@@ -466,11 +470,21 @@ class Operator:
                     "reply_to": handle.reply_to,
                     "command_id": inputs.get("command_id"),
                     "parent_gpu_task_id": handle.task_id,
+                    "workload_id": inputs.get("workload_id"),
+                    "block_id": handle.block_id,
                     "raw_ncu_report": outcome.payload.get("raw_ncu_report", {}),
                     "duration_s": inputs.get("post_cpu_duration_s", 10.0),
                     "sim_behavior": inputs.get("parse_sim_behavior", {}),
                 }
             )
+        elif handle.reply_to == "diagnosis":
+            res.deliveries.append(self._deliver(
+                receipt_id=receipt_id,
+                recipient=handle.reply_to,
+                result_kind=ResultKind.NCU_RAW.value,
+                handle=handle,
+                payload=raw_payload,
+            ))
         return res
 
     def _handle_ncu_parse(
@@ -496,6 +510,8 @@ class Operator:
                     "result_kind": ResultKind.NCU_PARSED.value,
                     "status": outcome.status,
                     **outcome.payload,
+                    "workload_id": handle.metadata.get("inputs", {}).get("workload_id"),
+                    "diagnostic_task_id": handle.metadata.get("inputs", {}).get("parent_gpu_task_id"),
                 },
             )
         )
@@ -547,6 +563,8 @@ class Operator:
                     "status": outcome.status,
                     "error": outcome.error,
                     **outcome.payload,
+                    "workload_id": handle.metadata.get("inputs", {}).get("workload_id"),
+                    "diagnostic_task_id": handle.task_id,
                 },
             )
         )

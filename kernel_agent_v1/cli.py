@@ -6,6 +6,7 @@ import argparse
 import asyncio
 import json
 import math
+import shutil
 from pathlib import Path
 import sys
 import tempfile
@@ -14,6 +15,7 @@ from kernel_agent_v1.async_runtime import AsyncKernelLabRunner, AsyncRunnerHooks
 from kernel_agent_v1.backends import RealSingleGpuBackend, SimulatedExecutionBackend
 from kernel_agent_v1.clock import RealClock, SimClock
 from kernel_agent_v1.closed_loop_tester import ClosedLoopTester
+from kernel_agent_v1.dual_research import DualResearch
 from kernel_agent_v1.evaluator import FINAL_BLOCK_IDS, TrustedEvaluator
 from kernel_agent_v1.experiments import format_comparison_report, run_three_way_comparison
 from kernel_agent_v1.gdn_task import load_official_definition, seed_gdn_candidate_source
@@ -53,6 +55,14 @@ def _run_end_to_end(args: argparse.Namespace) -> int:
         budgets.reserve_final_eval_s = len(FINAL_BLOCK_IDS) * final_timeout_s
         budgets.total_wall_budget_s += budgets.reserve_final_eval_s
         budgets.total_gpu_budget_s += budgets.reserve_final_eval_s
+    abba_timeout_s = args.abba_retest_timeout_s
+    if abba_timeout_s is None and args.backend == "real-gpu":
+        abba_timeout_s = 1800.0
+    if abba_timeout_s is not None:
+        budgets.abba_retest_job_timeout_s = abba_timeout_s
+        budgets.reserve_retest_s = abba_timeout_s
+        budgets.total_wall_budget_s += budgets.reserve_retest_s
+        budgets.total_gpu_budget_s += budgets.reserve_retest_s
     if args.wall_budget_s is not None:
         budgets.total_wall_budget_s = args.wall_budget_s
     if args.gpu_budget_s is not None:
@@ -172,6 +182,14 @@ def _run_end_to_end(args: argparse.Namespace) -> int:
     res_adapter = DeepSeekResearcherAdapter(llm_client, rt.leader, task_definition=task_definition)
     coder_adapter = DeepSeekCoderAdapter(llm_client, rt.coder, task_definition=task_definition)
 
+    dual_research = (
+        DualResearch(
+            rt, llm_client, lambda event: runner.submit_external_event(event),
+            ncu_available=args.backend == "sim" or shutil.which("ncu") is not None,
+        )
+        if args.dual_researcher else None
+    )
+
     async def _on_evidence(runtime: KernelLabRuntime, delivery: EvidenceDelivery) -> None:
         if not args.deepseek_live or rounds_remaining[0] <= 0:
             return
@@ -204,15 +222,18 @@ def _run_end_to_end(args: argparse.Namespace) -> int:
             return
         rounds_remaining[0] -= 1
         try:
-            cmd, _, usage = await res_adapter.plan_from_evidence(
-                researcher_id="res_main",
-                direction_id="gdn-prefill-main",
-                deliveries=[delivery],
-                repair_context=repair_context,
-                default_target=TargetRef(
-                    delivery.version_id or "V1", delivery.artifact_id or "art-seed-v0"
-                ),
-            )
+            design_role = "Design" if dual_research is not None else "Leader"
+            with runtime.timeline.measure(design_role, f"Plan from {delivery.receipt_id}"):
+                cmd, plan, usage = await res_adapter.plan_from_evidence(
+                    researcher_id="res_main",
+                    direction_id="gdn-prefill-main",
+                    deliveries=[delivery],
+                    repair_context=repair_context,
+                    dual_research=dual_research,
+                    default_target=TargetRef(
+                        delivery.version_id or "V1", delivery.artifact_id or "art-seed-v0"
+                    ),
+                )
         except LLMResponseFormatError as exc:
             runtime.controller.ledger.model_cost_used += exc.usage.cost_usd
             print(
@@ -222,8 +243,18 @@ def _run_end_to_end(args: argparse.Namespace) -> int:
             )
             return
         runtime.controller.ledger.model_cost_used += usage.cost_usd
+        if "diagnosis_feedback" in plan:
+            runtime.store.write_evidence(f"design-{cmd.head.command_id}", {
+                "command_id": cmd.head.command_id,
+                "trigger_receipt_id": delivery.receipt_id,
+                "version_id": delivery.version_id,
+                "issued_at_s": runtime.clock.now(),
+                **plan["diagnosis_feedback"],
+            })
         try:
-            evt, pkg, usage = await coder_adapter.implement(cmd, repair_context=repair_context)
+            with runtime.timeline.measure("Coder", f"Implement {cmd.head.command_id}") as span:
+                evt, pkg, usage = await coder_adapter.implement(cmd, repair_context=repair_context)
+                span.status = evt.event
         except LLMResponseFormatError as exc:
             usage = exc.usage
             evt, pkg = runtime.coder.execute_command(cmd, {"blocked_reason": str(exc)})
@@ -238,9 +269,16 @@ def _run_end_to_end(args: argparse.Namespace) -> int:
         await runner.submit_external_event(evt)
 
     runner = AsyncKernelLabRunner(
-        rt, hooks=AsyncRunnerHooks(on_research_evidence=_on_evidence)
+        rt, hooks=AsyncRunnerHooks(
+            on_research_evidence=_on_evidence,
+            on_diagnosis_evidence=dual_research.diagnose if dual_research else None,
+        )
     )
-    metrics = asyncio.run(runner.run())
+    timeline_path = (run_dir / "pipeline_timeline.html").resolve()
+    try:
+        metrics = asyncio.run(runner.run())
+    finally:
+        rt.timeline.write_html(timeline_path, cfg.run_id)
     # Surface any job execution errors clearly in stderr for immediate diagnostics
     for _, evt in rt.store.load_events():
         err = evt.extra.get("error")
@@ -250,7 +288,21 @@ def _run_end_to_end(args: argparse.Namespace) -> int:
                 f"status={evt.status} error={str(err)[:300]}",
                 file=sys.stderr,
             )
-    print(json.dumps(metrics.to_dict(), indent=2, ensure_ascii=False))
+    result = metrics.to_dict()
+    result["role_active_s"] = rt.timeline.active_seconds()
+    result["pipeline_timeline"] = str(timeline_path)
+    if dual_research is not None:
+        result["diagnosis"] = {
+            "conclusions": len(rt.wiki.diagnoses),
+            "gpu_requests": len(dual_research.requests),
+            "gpu_seconds": sum(
+                float(evt.extra.get("duration_s", 0))
+                for _, evt in rt.store.load_events()
+                if evt.extra.get("task_id") in dual_research.requests
+                and evt.event == "gpu_job_finished"
+            ),
+        }
+    print(json.dumps(result, indent=2, ensure_ascii=False))
     return 0
 
 
@@ -292,19 +344,27 @@ def main(argv: list[str] | None = None) -> int:
     )
     run_p.add_argument(
         "--wall-budget-s", type=float,
-        help="Total wall-clock budget in seconds. Default: 1800 plus the final-eval reserve on real GPU.",
+        help="Total wall-clock budget in seconds. Default: 1800 plus ABBA and final-eval reserves on real GPU.",
     )
     run_p.add_argument(
         "--gpu-budget-s", type=float,
-        help="Total GPU scheduling budget in seconds. Default: 1200 plus the final-eval reserve on real GPU.",
+        help="Total GPU scheduling budget in seconds. Default: 1200 plus ABBA and final-eval reserves on real GPU.",
     )
     run_p.add_argument(
         "--final-eval-timeout-s", type=_positive_seconds,
         help="Timeout per final-eval block in seconds. Default: 3600 on real GPU.",
     )
+    run_p.add_argument(
+        "--abba-retest-timeout-s", type=_positive_seconds,
+        help="Timeout per full ABBA retest in seconds. Default: 1800 on real GPU.",
+    )
     run_p.add_argument("--max-rounds", type=int, default=3)
     run_p.add_argument("--smoke-cases", type=int, default=0)
     run_p.add_argument("--deepseek-live", action="store_true")
+    run_p.add_argument(
+        "--dual-researcher", action="store_true",
+        help="Run a parallel Diagnosis Researcher alongside Design (requires --deepseek-live).",
+    )
     run_p.add_argument("--deepseek-model", type=str, default="deepseek-chat")
 
     args = parser.parse_args(argv)
@@ -324,6 +384,8 @@ def main(argv: list[str] | None = None) -> int:
         print(report.format_text(verbose=not args.quiet))
         return 0 if report.passed else 2
     if args.command == "run":
+        if args.dual_researcher and not args.deepseek_live:
+            run_p.error("--dual-researcher requires --deepseek-live")
         return _run_end_to_end(args)
     return 1
 

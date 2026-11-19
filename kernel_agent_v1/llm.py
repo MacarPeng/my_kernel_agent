@@ -7,7 +7,7 @@ import asyncio
 from dataclasses import dataclass, field
 import json
 import os
-from typing import Any, Callable
+from typing import TYPE_CHECKING, Any, Callable
 import urllib.request
 
 from kernel_agent_v1.coder import Coder
@@ -20,6 +20,10 @@ from kernel_agent_v1.protocol import (
     EvidenceDelivery,
     TargetRef,
 )
+
+
+if TYPE_CHECKING:
+    from kernel_agent_v1.dual_research import DualResearch
 
 
 class LLMNotConfiguredError(RuntimeError):
@@ -260,6 +264,7 @@ class DeepSeekResearcherAdapter:
         default_target: TargetRef,
         *,
         repair_context: dict[str, Any] | None = None,
+        dual_research: DualResearch | None = None,
     ) -> tuple[Command, dict[str, Any], LLMUsage]:
         researcher = self.leader.ensure_researcher(researcher_id)
         rid = self.leader.next_research_id()
@@ -318,6 +323,20 @@ class DeepSeekResearcherAdapter:
                 "Explain the cause and issue an implement_kernel instruction to repair the target "
                 "while preserving the task interface."
             )
+        design_evidence = deliveries[0] if dual_research is not None and deliveries else None
+        initial_diagnoses = []
+        if design_evidence is not None:
+            initial_diagnoses = dual_research.relevant_diagnoses(design_evidence)
+            sys_prompt += " Conclusions for ancestor versions are historical, not measurements of this target."
+            user_payload["available_diagnoses"] = initial_diagnoses
+            user_payload["pending_diagnostics"] = dual_research.pending_for(design_evidence)
+            sys_prompt += (
+                " You are the Design Researcher. Issue implement_kernel; Diagnosis owns GPU "
+                "diagnostics. Use the evidence now available and cite used conclusion IDs in "
+                "diagnosis_refs. Omit waiting by default. Only if you need a listed pending "
+                "diagnostic to make the design, return wait_for_diagnostic_task_id and finite "
+                "positive wait_seconds, along with your fallback instruction for expiry."
+            )
         parsed, usage = await _complete_json(
             self.llm,
             [
@@ -326,7 +345,63 @@ class DeepSeekResearcherAdapter:
             ],
         )
 
-        evidence_refs = (lookup.lookup_id,) + tuple(d.receipt_id for d in deliveries)
+        used_diagnoses: tuple[str, ...] = ()
+        if design_evidence is not None:
+            await dual_research.wait_if_requested(parsed, design_evidence)
+            current = dual_research.relevant_diagnoses(design_evidence)
+            initial_ids = {item["receipt_id"] for item in initial_diagnoses}
+            new_diagnoses = [
+                item for item in current
+                if item["receipt_id"] not in initial_ids and item["design_impact"]
+            ]
+            refs = parsed.get("diagnosis_refs")
+            used_diagnoses = tuple(
+                item["receipt_id"] for item in initial_diagnoses
+                if isinstance(refs, list) and item["receipt_id"] in refs
+            )
+            changed = False
+            if new_diagnoses:
+                try:
+                    revision, revision_usage = await _complete_json(self.llm, [
+                        LLMMessage("system", (
+                            "Review the proposed kernel design against the newly available "
+                            "diagnoses. Return JSON with the instruction and diagnosis_refs only "
+                            "if evidence changes the design. Cite the relevant diagnosis IDs. "
+                            "Otherwise return an empty JSON object."
+                        )),
+                        LLMMessage("user", json.dumps({
+                            "plan": parsed, "new_diagnoses": new_diagnoses,
+                            "task_definition": self.task_definition,
+                        }, ensure_ascii=False)),
+                    ])
+                    usage += revision_usage
+                    instruction = revision.get("instruction")
+                    refs = revision.get("diagnosis_refs")
+                    new_refs = tuple(
+                        item["receipt_id"] for item in new_diagnoses
+                        if isinstance(refs, list) and item["receipt_id"] in refs
+                    )
+                    if (
+                        isinstance(instruction, str) and instruction.strip() and new_refs
+                        and instruction.strip() != str(parsed.get("instruction", "")).strip()
+                    ):
+                        parsed["instruction"] = instruction.strip()
+                        used_diagnoses += new_refs
+                        changed = True
+                except LLMResponseFormatError as exc:
+                    usage += exc.usage
+                except (urllib.error.URLError, TimeoutError, json.JSONDecodeError):
+                    pass  # A failed optional review leaves the original plan available.
+            parsed["diagnosis_feedback"] = {
+                "ready_before_command": [
+                    item["receipt_id"] for item in dual_research.relevant_diagnoses(design_evidence)
+                ],
+                "late_diagnoses_reviewed": [item["receipt_id"] for item in new_diagnoses],
+                "cited_by_design": list(used_diagnoses),
+                "late_diagnosis_changed_instruction": changed,
+            }
+
+        evidence_refs = (lookup.lookup_id,) + tuple(d.receipt_id for d in deliveries) + used_diagnoses
         # Record structured research note once, reusing the mandatory initial Wiki lookup
         researcher.notes.append(
             ResearchNote(
@@ -356,7 +431,7 @@ class DeepSeekResearcherAdapter:
 
         cmd = self.leader.build_command(
             kind=(
-                CommandKind.IMPLEMENT_KERNEL.value if repair_context is not None
+                CommandKind.IMPLEMENT_KERNEL.value if repair_context is not None or dual_research is not None
                 else str(parsed.get("command_kind", CommandKind.IMPLEMENT_KERNEL.value))
             ),
             research_id=rid,

@@ -454,6 +454,7 @@ class BudgetConfig:
     max_compile_correctness_repairs: int = 2
     max_infra_retries: int = 1
     final_eval_job_timeout_s: float | None = None
+    abba_retest_job_timeout_s: float | None = None
 
 
 @dataclass

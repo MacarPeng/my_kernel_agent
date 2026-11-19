@@ -539,7 +539,7 @@ class LocalSubprocessBackend(ExecutionBackend):
         if returncode != 0:
             status = "infra_failed"
             error = stderr_b.decode("utf-8", errors="replace")
-        elif handle.kind == JobKind.BENCHMARK_BLOCK.value and failure in (
+        elif handle.kind in (JobKind.BENCHMARK_BLOCK.value, JobKind.PROBE.value) and failure in (
             "compile_failed", "candidate_failed", "numerical_failed"
         ):
             status = failure
@@ -736,6 +736,12 @@ class RealSingleGpuBackend(LocalSubprocessBackend):
         if resource == "gpu":
             env["CUDA_VISIBLE_DEVICES"] = str(self.gpu_index)
         enriched["env"] = env
+
+        if kind == JobKind.NCU_PARSE.value and "command" not in enriched:
+            enriched["command"] = [
+                sys.executable, "-m", "kernel_agent_v1.gdn_gpu_runner",
+                "--inputs", "inputs.json", "--output", "output.json",
+            ]
 
         if "command" not in enriched:
             tmpl = (
